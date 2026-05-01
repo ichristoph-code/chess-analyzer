@@ -559,12 +559,8 @@ function goToMove(idx) {
     clearExplanation();
   }
 
-  // Reset chat when navigating to a different move
-  const newKey = `${currentGame.id}:${target - 1}`;
-  if (newKey !== chatMoveKey) {
-    resetChat();
-    chatMoveKey = newKey;
-  }
+  // Switch chat to this move's conversation (restores prior messages if any)
+  switchChatToMove(`${currentGame.id}:${target - 1}`);
 }
 
 function stepMove(delta) {
@@ -931,12 +927,46 @@ async function refreshCoach() {
 // Chat dialog
 // ---------------------------------------------------------------------------
 
-let chatHistory  = [];   // [{role, content}] — resets on move navigation
-let chatMoveKey  = null; // "gameId:moveIdx" — detect when move changes
+let chatMoveKey = null; // "gameId:moveIdx" — current move key
+
+const CHAT_STORAGE_KEY = 'chess-chat-v1';
+
+function _loadChatStore() {
+  try { return JSON.parse(localStorage.getItem(CHAT_STORAGE_KEY) || '{}'); }
+  catch(e) { return {}; }
+}
+
+function _saveChatStore(store) {
+  try { localStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify(store)); }
+  catch(e) { /* storage full or unavailable */ }
+}
+
+function currentChatHistory() {
+  return _loadChatStore()[chatMoveKey] || [];
+}
+
+function _appendToHistory(moveKey, userMsg, assistantMsg) {
+  const store = _loadChatStore();
+  if (!store[moveKey]) store[moveKey] = [];
+  store[moveKey].push({role: 'user',      content: userMsg});
+  store[moveKey].push({role: 'assistant', content: assistantMsg});
+  _saveChatStore(store);
+}
 
 function resetChat() {
-  chatHistory = [];
+  chatMoveKey = null;
   document.getElementById('chat-thread').innerHTML = '';
+}
+
+function switchChatToMove(newKey) {
+  if (newKey === chatMoveKey) return;
+  chatMoveKey = newKey;
+
+  // Restore persisted conversation for this move
+  const thread = document.getElementById('chat-thread');
+  thread.innerHTML = '';
+  const history = _loadChatStore()[newKey] || [];
+  history.forEach(m => appendChatMsg(m.role, m.content));
 }
 
 function sendChat() {
@@ -945,13 +975,7 @@ function sendChat() {
   if (!msg || !currentGame) return;
 
   const moveIdx = currentMoveIdx - 1;
-  const moveKey = `${currentGame.id}:${moveIdx}`;
-
-  // Reset chat thread if the user navigated to a different move
-  if (moveKey !== chatMoveKey) {
-    resetChat();
-    chatMoveKey = moveKey;
-  }
+  switchChatToMove(`${currentGame.id}:${moveIdx}`);
 
   input.value = '';
   appendChatMsg('user', msg);
@@ -959,11 +983,12 @@ function sendChat() {
   const btn = document.getElementById('chat-send');
   btn.disabled = true;
 
+  const history = currentChatHistory();
   const body = {
     game_id:  currentGame.id,
     move_idx: moveIdx >= 0 ? moveIdx : null,
     message:  msg,
-    history:  chatHistory,
+    history:  history,
   };
 
   fetch('/api/chat', {
@@ -976,8 +1001,7 @@ function sendChat() {
       if (data.error) {
         appendChatMsg('assistant', `Error: ${data.error}`);
       } else {
-        chatHistory.push({role: 'user',      content: msg});
-        chatHistory.push({role: 'assistant', content: data.reply});
+        _appendToHistory(chatMoveKey, msg, data.reply);
         appendChatMsg('assistant', data.reply);
       }
     })

@@ -35,6 +35,7 @@ def generate_patterns(username, db_path, config):
             max_tokens=1400,
             system=SYSTEM_PROMPT,
             messages=[{'role': 'user', 'content': _build_prompt(stats)}],
+            timeout=120,
         )
         return response.content[0].text.strip()
     except Exception as e:
@@ -45,15 +46,16 @@ def generate_patterns(username, db_path, config):
 def _aggregate_stats(username, db_path):
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
-
-    rows = conn.execute(
-        """SELECT g.played_as, g.result, g.time_class, g.opening, g.eco, a.moves_json
-           FROM games g
-           JOIN analysis a ON g.id = a.game_id
-           WHERE g.username = ? AND a.moves_json IS NOT NULL""",
-        (username,),
-    ).fetchall()
-    conn.close()
+    try:
+        rows = conn.execute(
+            """SELECT g.played_as, g.result, g.time_class, g.opening, g.eco, a.moves_json
+               FROM games g
+               JOIN analysis a ON g.id = a.game_id
+               WHERE g.username = ? AND a.moves_json IS NOT NULL""",
+            (username,),
+        ).fetchall()
+    finally:
+        conn.close()
 
     if not rows:
         return None
@@ -105,9 +107,9 @@ def _aggregate_stats(username, db_path):
             mn = m.get('move_number', 0)
 
             if c in ('blunder', 'mistake', 'inaccuracy'):
-                if mn <= 12:
+                if mn <= 12:       # opening: moves 1-12
                     phase['opening'] += 1
-                elif mn <= 30:
+                elif mn <= 30:     # middlegame: moves 13-30
                     phase['middlegame'] += 1
                 else:
                     phase['endgame'] += 1

@@ -190,10 +190,13 @@ def _build_move_sequence(moves):
     return ' '.join(parts)
 
 
+OPENING_CUTOFF    = 12   # moves 1-12
+MIDDLEGAME_CUTOFF = 30   # moves 13-30; 31+ are endgame
+
 def _phase(move_number):
-    if move_number <= 12:
+    if move_number <= OPENING_CUTOFF:
         return 'opening'
-    if move_number <= 30:
+    if move_number <= MIDDLEGAME_CUTOFF:
         return 'middlegame'
     return 'endgame'
 

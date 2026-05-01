@@ -12,13 +12,14 @@ CACHE_TTL = 3600  # 1 hour
 HEADERS = {'User-Agent': 'chess-analyzer/1.0 (personal project)'}
 
 
-def fetch_games(username, months=3):
+def fetch_games(username, months=3, force=False):
     """Fetch recent games from chess.com for `username`, covering the last `months` months.
-    Returns a list of parsed game dicts. Results are cached for 1 hour."""
+    Returns a list of parsed game dicts. Results are cached for 1 hour.
+    Pass force=True to bypass the cache (e.g. on explicit user refresh)."""
     cache = _load_cache()
     cache_key = f"{username}_{months}"
     entry = cache.get(cache_key)
-    if entry and time.time() - entry['ts'] < CACHE_TTL:
+    if not force and entry and time.time() - entry['ts'] < CACHE_TTL:
         return entry['games']
 
     all_games = []

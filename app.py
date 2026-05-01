@@ -90,6 +90,7 @@ def init_db():
 def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")   # safe for concurrent readers + writer
     return conn
 
 # ---------------------------------------------------------------------------
@@ -112,11 +113,13 @@ def manifest():
 @app.route('/api/games')
 def list_games():
     conn = get_db()
-    rows = conn.execute(
-        """SELECT id, url, username, played_as, opponent, result, time_class, end_time, analyzed, eco, opening
-           FROM games ORDER BY end_time DESC LIMIT 100"""
-    ).fetchall()
-    conn.close()
+    try:
+        rows = conn.execute(
+            """SELECT id, url, username, played_as, opponent, result, time_class, end_time, analyzed, eco, opening
+               FROM games ORDER BY end_time DESC LIMIT 100"""
+        ).fetchall()
+    finally:
+        conn.close()
     return jsonify([dict(r) for r in rows])
 
 
@@ -128,7 +131,7 @@ def fetch():
 
     months = CONFIG.get('fetch_months', 3)
     try:
-        games = fetch_games(username, months)
+        games = fetch_games(username, months, force=True)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -154,54 +157,58 @@ def fetch():
 @app.route('/api/game/<game_id>')
 def get_game(game_id):
     conn = get_db()
-    game = conn.execute('SELECT * FROM games WHERE id = ?', (game_id,)).fetchone()
-    if not game:
+    try:
+        game     = conn.execute('SELECT * FROM games WHERE id = ?', (game_id,)).fetchone()
+        analysis = conn.execute(
+            'SELECT moves_json, claude_ok FROM analysis WHERE game_id = ?', (game_id,)
+        ).fetchone() if game else None
+    finally:
         conn.close()
-        return jsonify({'error': 'Game not found'}), 404
 
-    analysis = conn.execute(
-        'SELECT moves_json, claude_ok FROM analysis WHERE game_id = ?', (game_id,)
-    ).fetchone()
-    conn.close()
+    if not game:
+        return jsonify({'error': 'Game not found'}), 404
 
     result = dict(game)
     if analysis and analysis['moves_json']:
-        claude_ok = bool(analysis['claude_ok']) if analysis['claude_ok'] is not None else True
-        moves = json.loads(analysis['moves_json'])
-        result['moves']    = moves
-        result['analyzing'] = False
-        result['claude_ok'] = claude_ok
+        try:
+            moves = json.loads(analysis['moves_json'])
+        except (json.JSONDecodeError, TypeError):
+            moves = None
 
-        if not claude_ok:
-            # Commentary incomplete — either still running or needs resuming
-            if game_id not in _analysis_in_progress:
-                # Thread died (server restart, crash, timeout) — resume commentary only
-                _maybe_start_commentary(game_id, dict(game), moves)
-            result['commentary_pending'] = True
-        else:
-            result['commentary_pending'] = False
-    else:
-        # No analysis at all — kick off full Stockfish + Claude pipeline
-        _maybe_start_analysis(game_id, dict(game))
-        result['moves']              = None
-        result['analyzing']          = True
-        result['commentary_pending'] = False
+        if moves is not None:
+            claude_ok = bool(analysis['claude_ok']) if analysis['claude_ok'] is not None else True
+            result['moves']    = moves
+            result['analyzing'] = False
+            result['claude_ok'] = claude_ok
 
+            if not claude_ok:
+                if game_id not in _analysis_in_progress:
+                    _maybe_start_commentary(game_id, dict(game), moves)
+                result['commentary_pending'] = True
+            else:
+                result['commentary_pending'] = False
+            return jsonify(result)
+
+    # No analysis (or corrupted) — kick off full Stockfish + Claude pipeline
+    _maybe_start_analysis(game_id, dict(game))
+    result['moves']              = None
+    result['analyzing']          = True
+    result['commentary_pending'] = False
     return jsonify(result)
 
 
 @app.route('/api/game/<game_id>/analyze', methods=['POST'])
 def trigger_analysis(game_id):
     conn = get_db()
-    game = conn.execute('SELECT * FROM games WHERE id = ?', (game_id,)).fetchone()
-    if not game:
+    try:
+        game = conn.execute('SELECT * FROM games WHERE id = ?', (game_id,)).fetchone()
+        if not game:
+            return jsonify({'error': 'Game not found'}), 404
+        conn.execute('DELETE FROM analysis WHERE game_id = ?', (game_id,))
+        conn.execute('UPDATE games SET analyzed = 0 WHERE id = ?', (game_id,))
+        conn.commit()
+    finally:
         conn.close()
-        return jsonify({'error': 'Game not found'}), 404
-    # Clear old analysis so the full two-phase pipeline reruns cleanly
-    conn.execute('DELETE FROM analysis WHERE game_id = ?', (game_id,))
-    conn.execute('UPDATE games SET analyzed = 0 WHERE id = ?', (game_id,))
-    conn.commit()
-    conn.close()
     _maybe_start_analysis(game_id, dict(game), force=True)
     return jsonify({'status': 'analyzing'})
 
@@ -209,10 +216,12 @@ def trigger_analysis(game_id):
 @app.route('/api/game/<game_id>/status')
 def analysis_status(game_id):
     conn = get_db()
-    row = conn.execute(
-        'SELECT analyzed FROM games WHERE id = ?', (game_id,)
-    ).fetchone()
-    conn.close()
+    try:
+        row = conn.execute(
+            'SELECT analyzed FROM games WHERE id = ?', (game_id,)
+        ).fetchone()
+    finally:
+        conn.close()
     if not row:
         return jsonify({'error': 'not found'}), 404
     return jsonify({'analyzed': bool(row['analyzed'])})
@@ -225,10 +234,12 @@ def analysis_status(game_id):
 def patterns():
     username = CONFIG.get('chesscom_username', '')
     conn = get_db()
-    row = conn.execute(
-        'SELECT report, generated_at FROM patterns WHERE username = ?', (username,)
-    ).fetchone()
-    conn.close()
+    try:
+        row = conn.execute(
+            'SELECT report, generated_at FROM patterns WHERE username = ?', (username,)
+        ).fetchone()
+    finally:
+        conn.close()
     if row:
         return jsonify({'report': row['report'], 'generated_at': row['generated_at']})
     return jsonify({'report': None, 'generated_at': None})
@@ -236,7 +247,9 @@ def patterns():
 
 @app.route('/api/chat', methods=['POST'])
 def chat():
-    body = request.get_json(force=True)
+    body = request.get_json(silent=True)
+    if not body:
+        return jsonify({'error': 'invalid JSON'}), 400
     game_id  = body.get('game_id')
     move_idx = body.get('move_idx')
     message  = (body.get('message') or '').strip()
@@ -300,12 +313,17 @@ def _build_chat_context(game_id, move_idx):
         return ''
     try:
         conn = get_db()
-        game     = conn.execute('SELECT played_as, result, opening, eco FROM games WHERE id=?', (game_id,)).fetchone()
-        analysis = conn.execute('SELECT moves_json FROM analysis WHERE game_id=?', (game_id,)).fetchone()
-        conn.close()
+        try:
+            game     = conn.execute('SELECT played_as, result, opening, eco FROM games WHERE id=?', (game_id,)).fetchone()
+            analysis = conn.execute('SELECT moves_json FROM analysis WHERE game_id=?', (game_id,)).fetchone()
+        finally:
+            conn.close()
         if not game or not analysis:
             return ''
-        moves = json.loads(analysis['moves_json'])
+        try:
+            moves = json.loads(analysis['moves_json'])
+        except (json.JSONDecodeError, TypeError):
+            return ''
         if move_idx < 0 or move_idx >= len(moves):
             return ''
 
@@ -358,16 +376,19 @@ def _build_chat_context(game_id, move_idx):
 
 def _get_current_fen(game_id, move_idx):
     """Return the FEN for the position at move_idx (before the move is played)."""
-    if not game_id:
+    if not game_id or move_idx is None or move_idx < 0:
         return None
     try:
         conn = get_db()
-        analysis = conn.execute('SELECT moves_json FROM analysis WHERE game_id=?', (game_id,)).fetchone()
-        conn.close()
+        try:
+            analysis = conn.execute('SELECT moves_json FROM analysis WHERE game_id=?', (game_id,)).fetchone()
+        finally:
+            conn.close()
         if not analysis:
             return None
-        moves = json.loads(analysis['moves_json'])
-        if move_idx is None or move_idx < 0:
+        try:
+            moves = json.loads(analysis['moves_json'])
+        except (json.JSONDecodeError, TypeError):
             return None
         if move_idx < len(moves):
             # fen_before is the position the player is deciding in — that's what we want
@@ -424,10 +445,17 @@ def _maybe_start_commentary(game_id, game, moves):
 
 def _run_commentary(game_id, game, moves):
     """Run only the Claude explanation phase, then update the DB."""
+    conn = None
     try:
         played_as = game['played_as']
         moves = explain_game(moves, played_as, CONFIG, game_result=game.get('result', 'unknown'))
-        claude_ok = any(m.get('explanation') for m in moves)
+        # claude_ok: True if Claude was called and produced at least one explanation,
+        # OR if there were no moves that needed commentary (e.g. very short game).
+        needs_commentary = any(
+            m.get('color') == played_as and m.get('classification') not in (None, 'unknown')
+            for m in moves
+        )
+        claude_ok = (not needs_commentary) or any(m.get('explanation') for m in moves)
 
         conn = sqlite3.connect(DB_PATH)
         conn.execute(
@@ -435,22 +463,24 @@ def _run_commentary(game_id, game, moves):
             (json.dumps(moves), int(claude_ok), game_id),
         )
         conn.commit()
-        conn.close()
         print(f"Commentary complete for {game_id}: claude_ok={claude_ok}")
     except Exception as e:
         print(f"Commentary failed for {game_id}: {e}")
     finally:
+        if conn:
+            conn.close()
         with _analysis_lock:
             _analysis_in_progress.discard(game_id)
 
 
 def _run_analysis(game_id, game):
+    conn = None
     try:
         played_as = game['played_as']
         pgn       = game['pgn']
 
-        # Phase 1: Stockfish annotation — fast (~5s). Save immediately so the
-        # board is viewable while Claude runs in the background.
+        # Phase 1: Stockfish annotation. Save immediately so the board is
+        # viewable while Claude runs in the background.
         moves = annotate_game(pgn, played_as, CONFIG)
 
         conn = sqlite3.connect(DB_PATH)
@@ -461,10 +491,15 @@ def _run_analysis(game_id, game):
         conn.execute('UPDATE games SET analyzed = 1 WHERE id = ?', (game_id,))
         conn.commit()
         conn.close()
+        conn = None
 
-        # Phase 2: Claude commentary — slow (~60-120s). Update in place.
-        moves     = explain_game(moves, played_as, CONFIG, game_result=game.get('result', 'unknown'))
-        claude_ok = any(m.get('explanation') for m in moves)
+        # Phase 2: Claude commentary.
+        moves = explain_game(moves, played_as, CONFIG, game_result=game.get('result', 'unknown'))
+        needs_commentary = any(
+            m.get('color') == played_as and m.get('classification') not in (None, 'unknown')
+            for m in moves
+        )
+        claude_ok = (not needs_commentary) or any(m.get('explanation') for m in moves)
 
         conn = sqlite3.connect(DB_PATH)
         conn.execute(
@@ -484,10 +519,11 @@ def _run_analysis(game_id, game):
                 ).start()
 
         conn.commit()
-        conn.close()
     except Exception as e:
         print(f"Analysis failed for {game_id}: {e}")
     finally:
+        if conn:
+            conn.close()
         with _analysis_lock:
             _analysis_in_progress.discard(game_id)
 
