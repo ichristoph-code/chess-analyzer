@@ -1,0 +1,8 @@
+{
+  "chesscom_username": "your_chess_com_username",
+  "anthropic_api_key": "sk-ant-...",
+  "stockfish_path": "/opt/homebrew/bin/stockfish",
+  "stockfish_move_time": 0.1,
+  "port": 5050,
+  "fetch_months": 3
+}

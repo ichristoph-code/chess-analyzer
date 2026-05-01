@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Ian's Chess Analyzer</title>
+
+  <!-- PWA -->
+  <link rel="manifest" href="/manifest.json">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Chess">
+  <meta name="theme-color" content="#1a1a2e">
+
+  <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+
+<div id="app">
+
+  <!-- Nav bar -->
+  <nav id="nav">
+    <h1>♟ Ian's Chess Analyzer</h1>
+    <div id="nav-actions">
+      <button id="btn-fetch" onclick="fetchGames()">↓ Fetch</button>
+      <button id="btn-reanalyze-all" onclick="reAnalyzeAll()" title="Re-analyze all games with new settings">↺ Re-analyze All</button>
+    </div>
+  </nav>
+
+  <!-- Main content -->
+  <div id="main">
+
+    <!-- ── Left: Game list ─────────────────────────────────── -->
+    <div id="game-list-panel">
+      <h2>Recent Games</h2>
+      <div id="game-list">
+        <div style="padding:20px;color:var(--muted);font-size:13px">
+          Press "↓ Fetch" to load your games from chess.com
+        </div>
+      </div>
+
+      <!-- Resize handle between game list and coach panel -->
+      <div id="coach-resize" title="Drag to resize"></div>
+
+      <!-- Persistent coach panel -->
+      <div id="coach-panel">
+        <div id="coach-header" onclick="toggleCoach()">
+          <span id="coach-title">♟ Coach</span>
+          <div id="coach-header-actions">
+            <button id="coach-refresh-btn" onclick="event.stopPropagation(); refreshCoach()" title="Generate new report">↻</button>
+            <span id="coach-toggle-icon">▲</span>
+          </div>
+        </div>
+        <div id="coach-body">
+          <div id="coach-content" class="muted">Analyzing your games…</div>
+          <div id="coach-spinner" style="display:none">
+            <span class="spinner"></span> Generating report…
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Center: Board + moves ───────────────────────────── -->
+    <div id="board-panel">
+
+      <div id="placeholder">
+        <div class="icon">♟</div>
+        <p>Select a game from the list to start</p>
+      </div>
+
+      <div id="game-view" style="display:none">
+        <div id="board-container">
+          <div id="board"></div>
+        </div>
+
+        <!-- Eval graph -->
+        <canvas id="eval-graph" title="Click to jump to that move"></canvas>
+
+        <div id="move-panel">
+          <div id="move-nav">
+            <button onclick="goToMove(0)" title="Jump to start">⇤</button>
+            <button onclick="stepMove(-1)" title="Previous move">←</button>
+            <span id="move-counter">— / —</span>
+            <button onclick="stepMove(1)" title="Next move">→</button>
+            <button onclick="goToLastMove()" title="Jump to end">⇥</button>
+            <button onclick="flipBoard()" title="Flip board" id="btn-flip">⇅</button>
+          </div>
+          <div id="commentary-banner" style="display:none">
+            <span class="spinner"></span>
+            Generating Claude commentary…
+          </div>
+          <div id="analysis-error" style="display:none">
+            <span>⚠ Commentary failed</span>
+            <button onclick="reAnalyzeGame()">Retry</button>
+          </div>
+          <div id="move-list"></div>
+        </div>
+      </div>
+
+      <div id="analyzing-banner" style="display:none">
+        <span class="spinner"></span>
+        Analyzing with Stockfish… this may take a moment
+      </div>
+    </div>
+
+    <!-- ── Right: Analysis panel ───────────────────────────── -->
+    <div id="analysis-panel">
+      <div id="analysis-header">
+        <div id="analysis-header-top">
+          <span id="analysis-move-label">Select a game</span>
+          <span id="classification-badge" class="badge"></span>
+        </div>
+        <div id="game-opening-label"></div>
+        <button id="btn-reanalyze" onclick="reAnalyzeGame()" title="Re-analyze this game with current settings" style="display:none">↺ Re-analyze</button>
+      </div>
+      <div id="analysis-body">
+        <div id="analysis-coach-label">Coach</div>
+        <div id="analysis-comment" class="muted">
+          Select a game from the list, then navigate moves with ← → to see coaching commentary on each move.
+        </div>
+      </div>
+      <div id="analysis-body-resize" title="Drag to resize"></div>
+      <div id="analysis-footer">
+        <div id="analysis-best-move" style="display:none">
+          <span class="best-move-label">Better was</span>
+          <code id="analysis-best-move-san"></code>
+        </div>
+        <div id="analysis-eval"></div>
+      </div>
+
+      <!-- Chat dialog -->
+      <div id="chat-panel">
+        <div id="chat-thread"></div>
+        <div id="chat-input-row">
+          <input id="chat-input" type="text" placeholder="Ask about this move…" autocomplete="off">
+          <button id="chat-send" onclick="sendChat()">↑</button>
+        </div>
+      </div>
+    </div>
+
+
+  </div><!-- /main -->
+</div><!-- /app -->
+
+<script src="/static/js/app.js"></script>
+</body>
+</html>
