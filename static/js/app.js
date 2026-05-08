@@ -61,7 +61,7 @@ function changedSquares(fenBefore, fenAfter) {
 }
 
 // ---------------------------------------------------------------------------
-// Stockfish best-move arrow
+// Stockfish best-move arrow + actual move arrow
 // ---------------------------------------------------------------------------
 
 // Convert a square name like "g1" to a board array index (0=a8, 63=h1).
@@ -71,37 +71,35 @@ function uciSqToIdx(sq) {
   return rank * 8 + file;
 }
 
-// Draw a green arrow on the board SVG overlay for a Stockfish best-move UCI
-// string like "g1f3". Clears any existing arrow first.
-// orientation: 'white' | 'black'
-function drawBestMoveArrow(bestMoveUci, orientation) {
+// Return {fromIdx, toIdx} for the piece that moved between two FEN positions.
+function computeActualMove(fenBefore, fenAfter) {
+  const before = fenToArray(fenBefore);
+  const after  = fenToArray(fenAfter);
+  let fromIdx = -1, toIdx = -1;
+  for (let i = 0; i < 64; i++) {
+    if (before[i] !== after[i]) {
+      if (before[i] !== null && after[i] === null) fromIdx = i; // piece left
+      else if (before[i] === null && after[i] !== null) toIdx = i; // piece arrived
+    }
+  }
+  // Capture: to-square had an enemy piece (not empty) before the move
+  if (fromIdx >= 0 && toIdx < 0) {
+    for (let i = 0; i < 64; i++) {
+      if (i !== fromIdx && before[i] !== after[i] && after[i] !== null) { toIdx = i; break; }
+    }
+  }
+  return (fromIdx >= 0 && toIdx >= 0) ? { fromIdx, toIdx } : null;
+}
+
+// Draw the suggestion (green) and optionally the actual-move (gray) arrows
+// on a single SVG overlay. Pass actualMove={fromIdx,toIdx} or null.
+function drawMoveArrows(suggestedUci, actualMove, orientation) {
   const existing = document.getElementById('best-move-svg');
   if (existing) existing.remove();
-  if (!bestMoveUci || bestMoveUci.length < 4) return;
 
-  const fromIdx = uciSqToIdx(bestMoveUci.slice(0, 2));
-  const toIdx   = uciSqToIdx(bestMoveUci.slice(2, 4));
-
-  // Map board indices to visual grid positions based on orientation
-  const fromVis = orientation === 'black' ? 63 - fromIdx : fromIdx;
-  const toVis   = orientation === 'black' ? 63 - toIdx   : toIdx;
-
-  const fromRow = Math.floor(fromVis / 8), fromCol = fromVis % 8;
-  const toRow   = Math.floor(toVis   / 8), toCol   = toVis   % 8;
-
-  // 800×800 viewBox — each square is 100 units wide/tall
-  const x1 = fromCol * 100 + 50;
-  const y1 = fromRow * 100 + 50;
-  const x2 = toCol   * 100 + 50;
-  const y2 = toRow   * 100 + 50;
-
-  // Shorten the shaft so the arrowhead tip lands at the square center
-  const dx = x2 - x1, dy = y2 - y1;
-  const len = Math.sqrt(dx * dx + dy * dy);
-  const shorten = 30; // units to pull back before arrowhead
-  const scale   = Math.max(0, (len - shorten)) / len;
-  const ex = x1 + dx * scale;
-  const ey = y1 + dy * scale;
+  const hasSuggested = suggestedUci && suggestedUci.length >= 4;
+  const hasActual    = actualMove && actualMove.fromIdx >= 0 && actualMove.toIdx >= 0;
+  if (!hasSuggested && !hasActual) return;
 
   const NS  = 'http://www.w3.org/2000/svg';
   const svg = document.createElementNS(NS, 'svg');
@@ -111,43 +109,66 @@ function drawBestMoveArrow(bestMoveUci, orientation) {
   svg.style.cssText =
     'position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:10';
 
-  // Arrowhead marker
-  const defs   = document.createElementNS(NS, 'defs');
-  const marker = document.createElementNS(NS, 'marker');
-  marker.setAttribute('id', 'sf-head');
-  marker.setAttribute('markerWidth', '5');
-  marker.setAttribute('markerHeight', '5');
-  marker.setAttribute('refX', '4.5');
-  marker.setAttribute('refY', '2.5');
-  marker.setAttribute('orient', 'auto');
-  const head = document.createElementNS(NS, 'polygon');
-  head.setAttribute('points', '0 0, 5 2.5, 0 5');
-  head.setAttribute('fill', 'rgba(34,197,94,0.92)');
-  marker.appendChild(head);
-  defs.appendChild(marker);
+  const defs = document.createElementNS(NS, 'defs');
+  function makeMarker(id, fillColor) {
+    const m = document.createElementNS(NS, 'marker');
+    m.setAttribute('id', id);
+    m.setAttribute('markerWidth', '5');
+    m.setAttribute('markerHeight', '5');
+    m.setAttribute('refX', '4.5');
+    m.setAttribute('refY', '2.5');
+    m.setAttribute('orient', 'auto');
+    const p = document.createElementNS(NS, 'polygon');
+    p.setAttribute('points', '0 0, 5 2.5, 0 5');
+    p.setAttribute('fill', fillColor);
+    m.appendChild(p);
+    defs.appendChild(m);
+  }
+  if (hasActual)    makeMarker('actual-head', 'rgba(200,200,200,0.8)');
+  if (hasSuggested) makeMarker('sf-head',     'rgba(34,197,94,0.92)');
   svg.appendChild(defs);
 
-  // Origin circle (marks the from-square)
-  const circ = document.createElementNS(NS, 'circle');
-  circ.setAttribute('cx', x1);
-  circ.setAttribute('cy', y1);
-  circ.setAttribute('r', '20');
-  circ.setAttribute('fill', 'rgba(34,197,94,0.45)');
-  svg.appendChild(circ);
+  function addArrow(fromIdx, toIdx, strokeColor, circColor, markerId) {
+    const fromVis = orientation === 'black' ? 63 - fromIdx : fromIdx;
+    const toVis   = orientation === 'black' ? 63 - toIdx   : toIdx;
+    const x1 = (fromVis % 8) * 100 + 50, y1 = Math.floor(fromVis / 8) * 100 + 50;
+    const x2 = (toVis   % 8) * 100 + 50, y2 = Math.floor(toVis   / 8) * 100 + 50;
+    const dx = x2 - x1, dy = y2 - y1;
+    const len = Math.sqrt(dx * dx + dy * dy);
+    if (len === 0) return;
+    const scale = Math.max(0, (len - 30)) / len;
 
-  // Arrow shaft
-  const line = document.createElementNS(NS, 'line');
-  line.setAttribute('x1', x1);
-  line.setAttribute('y1', y1);
-  line.setAttribute('x2', ex);
-  line.setAttribute('y2', ey);
-  line.setAttribute('stroke', 'rgba(34,197,94,0.85)');
-  line.setAttribute('stroke-width', '16');
-  line.setAttribute('stroke-linecap', 'round');
-  line.setAttribute('marker-end', 'url(#sf-head)');
-  svg.appendChild(line);
+    const circ = document.createElementNS(NS, 'circle');
+    circ.setAttribute('cx', x1); circ.setAttribute('cy', y1);
+    circ.setAttribute('r', '20'); circ.setAttribute('fill', circColor);
+    svg.appendChild(circ);
+
+    const line = document.createElementNS(NS, 'line');
+    line.setAttribute('x1', x1); line.setAttribute('y1', y1);
+    line.setAttribute('x2', x1 + dx * scale); line.setAttribute('y2', y1 + dy * scale);
+    line.setAttribute('stroke', strokeColor);
+    line.setAttribute('stroke-width', '16');
+    line.setAttribute('stroke-linecap', 'round');
+    line.setAttribute('marker-end', `url(#${markerId})`);
+    svg.appendChild(line);
+  }
+
+  // Draw actual move first (behind), suggestion on top
+  if (hasActual) {
+    addArrow(actualMove.fromIdx, actualMove.toIdx,
+      'rgba(200,200,200,0.65)', 'rgba(200,200,200,0.35)', 'actual-head');
+  }
+  if (hasSuggested) {
+    addArrow(uciSqToIdx(suggestedUci.slice(0, 2)), uciSqToIdx(suggestedUci.slice(2, 4)),
+      'rgba(34,197,94,0.85)', 'rgba(34,197,94,0.45)', 'sf-head');
+  }
 
   document.getElementById('board').appendChild(svg);
+}
+
+// Backwards-compat wrapper used by any remaining direct callers
+function drawBestMoveArrow(bestMoveUci, orientation) {
+  drawMoveArrows(bestMoveUci, null, orientation);
 }
 
 // ---------------------------------------------------------------------------
@@ -206,7 +227,12 @@ let pollTimer        = null;     // setInterval handle while waiting for backgro
 // ---------------------------------------------------------------------------
 
 document.addEventListener('DOMContentLoaded', () => {
+  syncMobileViewportHeight();
+  window.addEventListener('resize', syncMobileViewportHeight);
+  window.addEventListener('orientationchange', syncMobileViewportHeight);
+
   renderBoard(STARTING_FEN, 'white', null);
+  loadCoachModel();
   loadGameList();
   loadCoach();
 
@@ -236,6 +262,52 @@ document.addEventListener('DOMContentLoaded', () => {
 // Game list
 // ---------------------------------------------------------------------------
 
+async function loadCoachModel() {
+  try {
+    const res = await fetch('/api/model');
+    const data = await res.json();
+    updateModelSwitch(data.mode);
+  } catch (e) {
+    console.warn('Model settings unavailable:', e);
+  }
+}
+
+function updateModelSwitch(mode) {
+  document.querySelectorAll('#model-switch button').forEach(btn => {
+    btn.classList.remove('active');
+    btn.disabled = false;
+  });
+
+  const active = document.getElementById(`model-${mode}`);
+  if (active) active.classList.add('active');
+}
+
+async function setCoachModel(mode) {
+  const buttons = document.querySelectorAll('#model-switch button');
+  buttons.forEach(btn => { btn.disabled = true; });
+
+  try {
+    const res = await fetch('/api/model', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({mode}),
+    });
+    const data = await res.json();
+    if (data.error) {
+      toast(data.error);
+      return;
+    }
+
+    updateModelSwitch(data.mode);
+    const label = data.mode === 'opus' ? 'Opus' : 'Sonnet';
+    toast(`${label} selected for new analyses`);
+  } catch (e) {
+    toast('Model switch failed: ' + e.message);
+  } finally {
+    buttons.forEach(btn => { btn.disabled = false; });
+  }
+}
+
 async function loadGameList() {
   const res   = await fetch('/api/games');
   const games = await res.json();
@@ -253,17 +325,45 @@ function renderGameList(games) {
     const date     = g.end_time ? new Date(g.end_time * 1000).toLocaleDateString() : '';
     const analyzed = g.analyzed ? '<span class="analyzed-dot" title="Analyzed"></span>' : '';
     const opening  = g.opening  ? `<div class="game-opening">${escHtml(g.opening)}</div>` : '';
+    const actionLabel = g.analyzed ? '↺' : 'Analyze';
+    const actionTitle = g.analyzed ? 'Re-analyze this game' : 'Analyze this game';
     return `
       <div class="game-item" onclick="loadGame('${g.id}')" data-id="${g.id}">
         <div class="game-item-header">
           <span class="result-badge result-${g.result}">${g.result.toUpperCase()}</span>
           <span class="game-opponent">${escHtml(g.opponent)}</span>
           ${analyzed}
+          <button class="game-analyze-btn" onclick="analyzeGameFromList(event, '${g.id}')" title="${actionTitle}">
+            ${actionLabel}
+          </button>
         </div>
         <div class="game-meta">${g.time_class} · ${g.played_as} · ${date}</div>
         ${opening}
       </div>`;
   }).join('');
+}
+
+function syncMobileViewportHeight() {
+  document.documentElement.style.setProperty('--app-height', `${window.innerHeight}px`);
+}
+
+function isMobileLayout() {
+  return window.matchMedia('(max-width: 900px)').matches;
+}
+
+function setMobileGamesVisible(visible) {
+  const panel = document.getElementById('game-list-panel');
+  const btn = document.getElementById('btn-mobile-games');
+  if (!panel || !btn) return;
+  panel.classList.toggle('show-mobile', visible);
+  btn.setAttribute('aria-expanded', visible ? 'true' : 'false');
+  document.body.classList.toggle('mobile-games-open', visible);
+}
+
+function toggleMobileGames() {
+  if (!isMobileLayout()) return;
+  const panel = document.getElementById('game-list-panel');
+  setMobileGamesVisible(!panel.classList.contains('show-mobile'));
 }
 
 async function fetchGames() {
@@ -293,6 +393,7 @@ async function loadGame(gameId) {
   document.querySelectorAll('.game-item').forEach(el => {
     el.classList.toggle('active', el.dataset.id === gameId);
   });
+  if (isMobileLayout()) setMobileGamesVisible(false);
 
   stopPolling();
 
@@ -420,6 +521,7 @@ function renderGame(game) {
   const reanalyzeBtn = document.getElementById('btn-reanalyze');
   reanalyzeBtn.style.display  = '';
   reanalyzeBtn.textContent    = '↺ Re-analyze';
+  document.getElementById('btn-redo-commentary').style.display = '';
 
   // Commentary loading banner: shown while Claude is still generating
   const commentaryBanner = document.getElementById('commentary-banner');
@@ -469,10 +571,18 @@ function flipBoard() {
       fen = move.fen;
       if (move.fen_before) hl = changedSquares(move.fen_before, move.fen);
     }
-    bmUci = moves[currentMoveIdx] ? (moves[currentMoveIdx].best_move_uci || null) : null;
+  }
+  let actualMove = null;
+  if (currentGame && currentGame.moves && currentMoveIdx > 0) {
+    const moves = currentGame.moves;
+    const m = moves[currentMoveIdx - 1];
+    bmUci = m ? (m.best_move_uci || null) : null;
+    if (bmUci && m.classification !== 'best' && m.fen_before && m.fen) {
+      actualMove = computeActualMove(m.fen_before, m.fen);
+    }
   }
   renderBoard(fen, boardOrientation, hl);
-  drawBestMoveArrow(bmUci, boardOrientation);
+  drawMoveArrows(bmUci, actualMove, boardOrientation);
 }
 
 // ---------------------------------------------------------------------------
@@ -542,11 +652,19 @@ function goToMove(idx) {
 
   renderBoard(fen, boardOrientation, hl);
 
-  // Arrow: best move from the currently displayed position.
-  // moves[target] holds the best_move_uci computed from the position we just
-  // rendered (its fen_before == the displayed fen).
-  const bmUci = moves[target] ? (moves[target].best_move_uci || null) : null;
-  drawBestMoveArrow(bmUci, boardOrientation);
+  // Arrow: show the engine's suggestion for the move just played (moves[target-1])
+  // alongside a gray arrow for what was actually played — both at the same time.
+  let bmUci      = null;
+  let actualMove = null;
+  if (target > 0 && moves[target - 1]) {
+    const m = moves[target - 1];
+    bmUci = m.best_move_uci || null;
+    // Show gray actual-move arrow only when the played move differs from the suggestion
+    if (bmUci && m.classification !== 'best' && m.fen_before && m.fen) {
+      actualMove = computeActualMove(m.fen_before, m.fen);
+    }
+  }
+  drawMoveArrows(bmUci, actualMove, boardOrientation);
 
   updateMoveHighlight(target - 1);
   updateMoveCounter();
@@ -614,6 +732,20 @@ async function reAnalyzeGame() {
   btn.textContent = '↺ Re-analyze';
 }
 
+async function analyzeGameFromList(event, gameId) {
+  event.stopPropagation();
+  const btn = event.currentTarget;
+  btn.disabled = true;
+  btn.textContent = '…';
+
+  await fetch(`/api/game/${gameId}/analyze`, { method: 'POST' });
+  toast('Analyzing this game…');
+  if (isMobileLayout()) setMobileGamesVisible(false);
+  await loadGame(gameId);
+
+  btn.disabled = false;
+}
+
 async function reAnalyzeAll() {
   const btn = document.getElementById('btn-reanalyze-all');
   btn.disabled = true;
@@ -645,7 +777,31 @@ async function reAnalyzeAll() {
   toast(`${analyzed.length} games queued. Analysis runs in the background.`);
   btn.textContent = '↺ Re-analyze All';
   btn.disabled    = false;
-  loadGameList();   // refresh the list to show analyzing dots
+  loadGameList();
+}
+
+async function redoCommentary() {
+  if (!currentGame) return;
+  const btn = document.getElementById('btn-redo-commentary');
+  btn.disabled = true;
+  btn.textContent = '…';
+  await fetch(`/api/game/${currentGame.id}/redo-commentary`, { method: 'POST' });
+  document.getElementById('commentary-banner').style.display = 'block';
+  stopPolling();
+  pollTimer = setInterval(() => checkAnalysisStatus(currentGame.id), 4000);
+  btn.disabled = false;
+  btn.textContent = '↻ Refresh Commentary';
+}
+
+async function refreshAllCommentary() {
+  const btn = document.getElementById('btn-refresh-commentary');
+  btn.disabled = true;
+  btn.textContent = '↻ Queuing…';
+  const res  = await fetch('/api/commentary/refresh-all', { method: 'POST' });
+  const data = await res.json();
+  toast(`Refreshing commentary for ${data.count} games in the background.`);
+  btn.textContent = '↻ Refresh Commentary';
+  btn.disabled = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -875,21 +1031,101 @@ function toggleCoach() {
 }
 
 async function loadCoach() {
-  const res  = await fetch('/api/patterns');
-  const data = await res.json();
-  const el   = document.getElementById('coach-content');
+  const el = document.getElementById('coach-content');
 
-  if (data.report) {
-    el.textContent = data.report;
-    el.classList.remove('muted');
-    if (data.generated_at) {
-      const date = new Date(data.generated_at * 1000).toLocaleDateString();
-      document.getElementById('coach-title').textContent = `♟ Coach · ${date}`;
+  // Prefer the Claude-generated patterns report (deep personal analysis)
+  try {
+    const res  = await fetch('/api/patterns');
+    const data = await res.json();
+    if (data.report) {
+      renderPatterns(data.report, data.generated_at);
+      return;
     }
-  } else {
-    el.textContent = 'No report yet. Analyze a few games then click ↻ to generate.';
-    el.classList.add('muted');
+  } catch (e) {
+    console.warn('Patterns unavailable:', e);
   }
+
+  // Fall back to rule-based blueprint if no Claude report yet
+  try {
+    const blueprintRes = await fetch('/api/blueprint');
+    const blueprint = await blueprintRes.json();
+    if (!blueprint.error) {
+      renderBlueprint(blueprint);
+      return;
+    }
+  } catch (e) {
+    console.warn('Blueprint unavailable:', e);
+  }
+
+  el.textContent = 'No report yet. Analyze a few games then click ↻ to generate.';
+  el.classList.add('muted');
+}
+
+function renderPatterns(report, generated_at) {
+  const el = document.getElementById('coach-content');
+  el.classList.remove('muted');
+
+  if (generated_at) {
+    const date = new Date(generated_at * 1000).toLocaleDateString();
+    document.getElementById('coach-title').textContent = `♟ Coach · ${date}`;
+  }
+
+  // Render bullet points and bold text from the Claude report
+  const html = report
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+    .split(/\n+/)
+    .map(line => {
+      line = line.trim();
+      if (!line) return '';
+      if (line.startsWith('•')) {
+        return `<div class="pattern-bullet">${line.slice(1).trim()}</div>`;
+      }
+      return `<p>${line}</p>`;
+    })
+    .join('');
+
+  el.innerHTML = html;
+}
+
+function renderBlueprint(blueprint) {
+  const el = document.getElementById('coach-content');
+  el.classList.remove('muted');
+
+  if (!blueprint.ready) {
+    el.textContent = blueprint.summary;
+    el.classList.add('muted');
+    return;
+  }
+
+  const metrics = (blueprint.metrics || []).map(m => `
+    <div class="blueprint-metric">
+      <span>${escHtml(m.label)}</span>
+      <strong>${escHtml(m.value)}</strong>
+    </div>`).join('');
+
+  const focusAreas = (blueprint.focus_areas || []).map(area => `
+    <section class="blueprint-focus">
+      <h3>${escHtml(area.title)}</h3>
+      <p>${escHtml(area.why)}</p>
+      <div class="blueprint-practice">${escHtml(area.practice)}</div>
+    </section>`).join('');
+
+  const nextSteps = (blueprint.next_steps || []).map(step =>
+    `<li>${escHtml(step)}</li>`
+  ).join('');
+
+  el.innerHTML = `
+    <div class="blueprint">
+      <p class="blueprint-summary">${escHtml(blueprint.summary)}</p>
+      <div class="blueprint-metrics">${metrics}</div>
+      ${focusAreas}
+      ${nextSteps ? `
+        <section class="blueprint-next">
+          <h3>Next practice plan</h3>
+          <ol>${nextSteps}</ol>
+        </section>` : ''}
+    </div>`;
 }
 
 async function refreshCoach() {
@@ -911,8 +1147,7 @@ async function refreshCoach() {
       btn.disabled          = false;
       spinner.style.display = 'none';
       el.style.display      = '';
-      el.textContent        = data.report;
-      el.classList.remove('muted');
+      await loadCoach();
       if (data.generated_at) {
         const date = new Date(data.generated_at * 1000).toLocaleDateString();
         document.getElementById('coach-title').textContent = `♟ Coach · ${date}`;

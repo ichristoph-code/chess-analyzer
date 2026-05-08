@@ -3,6 +3,9 @@
   "anthropic_api_key": "sk-ant-...",
   "stockfish_path": "/opt/homebrew/bin/stockfish",
   "stockfish_move_time": 0.1,
+  "explain_model": "claude-sonnet-4-5-20250929",
+  "chat_model": "claude-sonnet-4-5-20250929",
+  "patterns_model": "claude-sonnet-4-5-20250929",
   "port": 5050,
   "fetch_months": 3
 }

@@ -1,6 +1,14 @@
 config.json
 chess.db
+chess.db-shm
+chess.db-wal
 .chesscom_cache.json
 __pycache__/
 *.pyc
 .DS_Store
+*.swp
+.venv/
+venv/
+
+# Don't commit the built macOS app wrapper
+Chess Analyzer.app/

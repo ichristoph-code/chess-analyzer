@@ -8,9 +8,15 @@ import time
 
 from flask import Flask, jsonify, render_template, request, send_from_directory
 
-from analysis.claude_explain import explain_game
+from analysis.blueprint import generate_blueprint
+from analysis.claude_explain import (
+    explain_game,
+    fill_fast_comments,
+    finalize_fast_comments,
+    needs_claude_commentary,
+)
 from analysis.engine import annotate_game, get_best_move
-from analysis.patterns import generate_patterns
+from analysis.patterns import generate_patterns, get_player_weakness_summary
 from sources.chesscom import fetch_games
 
 # ---------------------------------------------------------------------------
@@ -18,6 +24,10 @@ from sources.chesscom import fetch_games
 # ---------------------------------------------------------------------------
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'config.json')
+MODEL_PRESETS = {
+    'sonnet': 'claude-sonnet-4-6',
+    'opus': 'claude-opus-4-7',
+}
 
 def load_config():
     if not os.path.exists(CONFIG_PATH):
@@ -29,12 +39,46 @@ def load_config():
 
 CONFIG = load_config()
 
+def save_config():
+    tmp_path = CONFIG_PATH + '.tmp'
+    with open(tmp_path, 'w') as f:
+        json.dump(CONFIG, f, indent=2)
+        f.write('\n')
+    os.replace(tmp_path, CONFIG_PATH)
+
+def current_model_mode():
+    explain_model = CONFIG.get('explain_model')
+    for mode, model in MODEL_PRESETS.items():
+        if explain_model == model:
+            return mode
+    return 'custom'
+
+def friendly_api_error(error):
+    msg = str(error)
+    if 'credit balance is too low' in msg:
+        return (
+            "Anthropic says this API key's credit balance is too low. "
+            "Check the Anthropic Console organization/workspace tied to this key, "
+            "not just your Claude subscription or another billing workspace."
+        )
+    return msg
+
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
 
 app = Flask(__name__)
 DB_PATH = os.path.join(os.path.dirname(__file__), 'chess.db')
+
+
+@app.after_request
+def _no_cache_for_api(response):
+    """Never cache API responses — prevents stale commentary in the browser after refresh."""
+    if request.path.startswith('/api/'):
+        response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+        response.headers['Pragma'] = 'no-cache'
+        response.headers['Expires'] = '0'
+    return response
 
 # ---------------------------------------------------------------------------
 # Database
@@ -106,6 +150,11 @@ def index():
 def manifest():
     return send_from_directory(os.path.dirname(__file__), 'manifest.json')
 
+
+@app.route('/sw.js')
+def service_worker():
+    return send_from_directory(os.path.dirname(__file__), 'sw.js', mimetype='application/javascript')
+
 # ---------------------------------------------------------------------------
 # Routes — Games API
 # ---------------------------------------------------------------------------
@@ -121,6 +170,35 @@ def list_games():
     finally:
         conn.close()
     return jsonify([dict(r) for r in rows])
+
+
+@app.route('/api/model', methods=['GET', 'POST'])
+def model_settings():
+    if request.method == 'GET':
+        return jsonify({
+            'mode': current_model_mode(),
+            'explain_model': CONFIG.get('explain_model'),
+            'chat_model': CONFIG.get('chat_model'),
+            'patterns_model': CONFIG.get('patterns_model'),
+        })
+
+    body = request.get_json(silent=True) or {}
+    mode = body.get('mode')
+    if mode not in MODEL_PRESETS:
+        return jsonify({'error': 'Choose sonnet or opus'}), 400
+
+    model = MODEL_PRESETS[mode]
+    CONFIG['explain_model'] = model
+    CONFIG['chat_model'] = model
+    CONFIG['patterns_model'] = model
+    save_config()
+
+    return jsonify({
+        'mode': mode,
+        'explain_model': model,
+        'chat_model': model,
+        'patterns_model': model,
+    })
 
 
 @app.route('/api/games/fetch', methods=['POST'])
@@ -182,10 +260,14 @@ def get_game(game_id):
             result['claude_ok'] = claude_ok
 
             if not claude_ok:
+                moves = fill_fast_comments(moves, result.get('played_as'))
+                result['moves'] = moves
                 if game_id not in _analysis_in_progress:
                     _maybe_start_commentary(game_id, dict(game), moves)
                 result['commentary_pending'] = True
             else:
+                moves = finalize_fast_comments(moves, result.get('played_as'))
+                result['moves'] = moves
                 result['commentary_pending'] = False
             return jsonify(result)
 
@@ -211,6 +293,50 @@ def trigger_analysis(game_id):
         conn.close()
     _maybe_start_analysis(game_id, dict(game), force=True)
     return jsonify({'status': 'analyzing'})
+
+
+@app.route('/api/game/<game_id>/redo-commentary', methods=['POST'])
+def redo_commentary(game_id):
+    """Re-run only the Claude commentary step, keeping Stockfish data intact."""
+    conn = get_db()
+    try:
+        game = conn.execute('SELECT * FROM games WHERE id = ?', (game_id,)).fetchone()
+        if not game:
+            return jsonify({'error': 'Game not found'}), 404
+        analysis = conn.execute(
+            'SELECT moves_json FROM analysis WHERE game_id = ?', (game_id,)
+        ).fetchone()
+        if not analysis:
+            return jsonify({'error': 'No Stockfish data yet — run full analysis first'}), 400
+        moves = json.loads(analysis['moves_json'])
+    finally:
+        conn.close()
+
+    _maybe_start_commentary(game_id, dict(game), moves)
+    return jsonify({'status': 'commentary_queued'})
+
+
+@app.route('/api/commentary/refresh-all', methods=['POST'])
+def refresh_all_commentary():
+    """Re-run Claude commentary for every analyzed game."""
+    conn = get_db()
+    try:
+        username = CONFIG.get('chesscom_username', '')
+        rows = conn.execute(
+            'SELECT g.id, g.*, a.moves_json FROM games g JOIN analysis a ON g.id = a.game_id '
+            'WHERE g.username = ? AND g.analyzed = 1 AND a.moves_json IS NOT NULL',
+            (username,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    queued = 0
+    for row in rows:
+        moves = json.loads(row['moves_json'])
+        _maybe_start_commentary(row['id'], dict(row), moves)
+        queued += 1
+
+    return jsonify({'status': 'queued', 'count': queued})
 
 
 @app.route('/api/game/<game_id>/status')
@@ -243,6 +369,14 @@ def patterns():
     if row:
         return jsonify({'report': row['report'], 'generated_at': row['generated_at']})
     return jsonify({'report': None, 'generated_at': None})
+
+
+@app.route('/api/blueprint')
+def blueprint():
+    username = CONFIG.get('chesscom_username', '')
+    if not username:
+        return jsonify({'error': 'chesscom_username not set'}), 400
+    return jsonify(generate_blueprint(username, DB_PATH, CONFIG))
 
 
 @app.route('/api/chat', methods=['POST'])
@@ -297,7 +431,7 @@ def chat():
 
     try:
         resp = client.messages.create(
-            model='claude-sonnet-4-6',
+            model=CONFIG.get('chat_model', CONFIG.get('explain_model', MODEL_PRESETS['sonnet'])),
             max_tokens=400,
             system=system,
             messages=messages,
@@ -305,7 +439,7 @@ def chat():
         reply = resp.content[0].text.strip()
         return jsonify({'reply': reply})
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': friendly_api_error(e)}), 500
 
 
 def _build_chat_context(game_id, move_idx):
@@ -448,14 +582,17 @@ def _run_commentary(game_id, game, moves):
     conn = None
     try:
         played_as = game['played_as']
-        moves = explain_game(moves, played_as, CONFIG, game_result=game.get('result', 'unknown'))
-        # claude_ok: True if Claude was called and produced at least one explanation,
-        # OR if there were no moves that needed commentary (e.g. very short game).
-        needs_commentary = any(
-            m.get('color') == played_as and m.get('classification') not in (None, 'unknown')
-            for m in moves
-        )
-        claude_ok = (not needs_commentary) or any(m.get('explanation') for m in moves)
+        username  = game.get('username', CONFIG.get('chesscom_username', ''))
+        moves = fill_fast_comments(moves, played_as)
+        if needs_claude_commentary(moves, played_as):
+            player_profile = get_player_weakness_summary(username, DB_PATH)
+            moves = explain_game(
+                moves, played_as, CONFIG,
+                game_result=game.get('result', 'unknown'),
+                player_profile=player_profile,
+            )
+        moves = finalize_fast_comments(moves, played_as)
+        claude_ok = True
 
         conn = sqlite3.connect(DB_PATH)
         conn.execute(
@@ -482,11 +619,13 @@ def _run_analysis(game_id, game):
         # Phase 1: Stockfish annotation. Save immediately so the board is
         # viewable while Claude runs in the background.
         moves = annotate_game(pgn, played_as, CONFIG)
+        moves = fill_fast_comments(moves, played_as)
+        needs_commentary = needs_claude_commentary(moves, played_as)
 
         conn = sqlite3.connect(DB_PATH)
         conn.execute(
             'INSERT OR REPLACE INTO analysis (game_id, moves_json, claude_ok) VALUES (?,?,?)',
-            (game_id, json.dumps(moves), 0),  # claude_ok=0 → commentary pending
+            (game_id, json.dumps(moves), int(not needs_commentary)),
         )
         conn.execute('UPDATE games SET analyzed = 1 WHERE id = ?', (game_id,))
         conn.commit()
@@ -494,17 +633,20 @@ def _run_analysis(game_id, game):
         conn = None
 
         # Phase 2: Claude commentary.
-        moves = explain_game(moves, played_as, CONFIG, game_result=game.get('result', 'unknown'))
-        needs_commentary = any(
-            m.get('color') == played_as and m.get('classification') not in (None, 'unknown')
-            for m in moves
-        )
-        claude_ok = (not needs_commentary) or any(m.get('explanation') for m in moves)
+        if needs_commentary:
+            username = game.get('username', CONFIG.get('chesscom_username', ''))
+            player_profile = get_player_weakness_summary(username, DB_PATH)
+            moves = explain_game(
+                moves, played_as, CONFIG,
+                game_result=game.get('result', 'unknown'),
+                player_profile=player_profile,
+            )
+        moves = finalize_fast_comments(moves, played_as)
 
         conn = sqlite3.connect(DB_PATH)
         conn.execute(
             'UPDATE analysis SET moves_json=?, claude_ok=? WHERE game_id=?',
-            (json.dumps(moves), int(claude_ok), game_id),
+            (json.dumps(moves), 1, game_id),
         )
 
         # Auto-regenerate patterns every 5 newly analyzed games
@@ -550,5 +692,11 @@ def _auto_gen_patterns(username):
 if __name__ == '__main__':
     init_db()
     port = CONFIG.get('port', 5050)
-    print(f"Chess Analyzer → http://localhost:{port}")
-    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
+    # Auto-reload on Python file changes; use_reloader spawns a watcher process.
+    # Set CHESS_NO_RELOAD=1 to disable (e.g. when launched headless).
+    use_reloader = os.environ.get('CHESS_NO_RELOAD') != '1'
+    print(f"Chess Analyzer → http://localhost:{port} (auto-reload {'on' if use_reloader else 'off'})")
+    app.run(
+        host='0.0.0.0', port=port, threaded=True,
+        debug=use_reloader, use_reloader=use_reloader,
+    )

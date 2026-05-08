@@ -1,84 +1,101 @@
-"""Single-call batch analysis: one Claude request per game, commentary on every move."""
+"""Fast commentary helpers plus selective Claude explanations.
+
+Most moves can be explained well enough from the Stockfish numbers already on
+the move object. Claude is reserved for the player's own inaccurate moves,
+mistakes, and blunders, where a more specific coaching note is worth the wait.
+"""
 
 import json
+import re
 import anthropic
+import chess
 
 SYSTEM_PROMPT = """\
-You are an expert chess coach analyzing a beginner's game (~850 rated). For each move, write specific, educational commentary using the Stockfish data provided — including candidate moves, evaluations, and the engine's suggested continuation.
+You are a personal chess coach writing commentary for a specific player whose recurring mistakes you know well.
 
-=== WHAT YOU HAVE ACCESS TO ===
-For every move you will receive:
-- The move played and its classification (best/inaccuracy/mistake/blunder)
-- Eval before and after (white's POV in pawns)
-- For bad moves on critical positions: Stockfish's top candidate moves with their evals, AND the full continuation line (6 moves deep) showing what would have happened after the best move
+=== REQUIRED COMMENT STRUCTURE — follow this order for every mistake ===
+1. PATTERN CALL-OUT (1 sentence, always first): Does this match a weakness in the player profile? If yes, open with: "Again — [pattern name]." or "You've hit your [pattern] problem again." If it's new: "New pattern to watch: [brief name]."
+2. WHAT WENT WRONG (1-2 sentences): Explain the mistake in plain English using only the evaluation swing and Stockfish preference.
+3. WHAT TO DO INSTEAD (1 sentence): Name the Stockfish preferred move exactly as supplied, but do not explain it by reconstructing piece locations.
 
-USE THIS DATA. Don't speak in generalities. Name pieces, squares, tactical ideas. If you have a PV line, explain what it shows.
+Total: 3 sentences max. Short, sharp, personal.
 
-=== PHASE-SPECIFIC COACHING STANDARDS ===
+The player profile appears at the top of the user message — it lists their real recurring weaknesses from 27 games. Read it before writing anything.
 
-OPENING (moves 1–12): Focus on development principles.
-- Is the player developing pieces toward the center? Castling on time? Fighting for center control?
-- Flag specific opening mistakes: moving a piece twice before developing others, weakening pawn structure, ignoring opponent's threats, not castling when possible.
+=== STYLE ===
+- Plain English. You may name the played move and the Stockfish preferred move, but do not name exact piece locations.
+- Lead with "you" language: "You missed...", "You walked into...", "You left your..."
+- Ruthlessly honest but not discouraging.
 
-MIDDLEGAME (moves 13–30): Focus on tactics and plans.
-- What is each side's strategic plan? Who controls the center or an open file?
-- Flag tactical opportunities missed or created. Name the specific tactic if applicable.
-- Flag when the player walks into or ignores tactical threats.
+=== ACCURACY RULES — strictly enforced ===
+- Every move block contains a BOARD STATE section listing every piece and its exact square, machine-generated from the FEN. Use this as your ground truth.
+- Every move block also contains MOVE FACTS confirming exactly what moved, what was captured, and whether pieces are newly hanging.
+- Do NOT use your own memory, the move sequence, or mental reconstruction to place pieces. Only use BOARD STATE and MOVE FACTS.
+- You may name a piece on a specific square only if that square appears in BOARD STATE or MOVE FACTS for that move.
+- Only name a tactical motif (fork, pin, skewer, etc.) if MOVE FACTS explicitly describes it. If no motif is listed, say "you gave up too much evaluation" or "you missed the steadier move."
+- Being less specific is always better than being wrong.
 
-ENDGAME (moves 31+): Focus on king activity, pawn promotion, piece coordination.
-- Is the king active? Are passed pawns being advanced or stopped?
-- Flag missed pawn promotions, king misplacement, wrong piece trades.
-
-=== TACTICAL MOTIF IDENTIFICATION ===
-If a blunder or mistake involves a tactical motif, NAME IT explicitly:
-- Fork: "This allowed a knight fork — your opponent's knight attacked both your queen and rook simultaneously."
-- Pin: "Your bishop is now pinned to your king — it can't move without exposing your king to check."
-- Skewer, discovered attack, back-rank mate, hanging piece, overloaded piece — name them when present.
-
-=== HOW TO USE STOCKFISH CANDIDATE MOVES ===
-When you have candidates and a PV line, use them to make the explanation concrete:
-- Explain WHY the top candidate is better (what threat it creates, what plan it follows)
-- If there's a PV continuation, explain what the sequence shows (e.g., "After Nf6, the knight threatens both the queen and a back-rank mate — white is forced to give up material")
-- Compare the player's move to the top candidate: what specifically did the player miss?
-- If the 2nd/3rd candidates show the range of good options, mention that (e.g., "Both Nf6 and Qd4 win; you played into a tactic instead")
-
-=== COMMENTARY FORMAT ===
-For MY moves (player's own moves):
-- 3–4 sentences for mistakes/blunders. Be specific and use the engine data.
-- 2 sentences for good moves: explain what threat it creates or plan it follows.
-- If you have a PV line, reference it: "Stockfish shows that after Nf6 Qe2 Rxd4, white wins the queen."
-
-For OPP moves (opponent's moves):
-- Exactly 1 sentence. State the threat or plan created, or note the blunder if significant.
-- If the opponent blundered: "Your opponent blundered — [specific threat] was available here."
-
-=== STYLE RULES ===
-- Plain English only. No algebraic notation in the explanation text — use piece names and squares ("your knight on f6", "the f-file", "their bishop on b5").
-- Reference the evaluation when it matters: "This move flipped a +2 advantage into a -1 position — a 3-pawn swing."
-- Be encouraging but ruthlessly honest. Never sugarcoat a blunder.
-- Don't waste words hedging. Every sentence should teach something.
-
-Respond with ONLY valid JSON, no markdown fences, no extra text:
+Respond with ONLY valid JSON:
 {"comments": [{"idx": <integer>, "comment": "<string>"}, ...]}\
 """
 
 # Moves that get auto-generated comments (no Claude needed)
 _AUTO_OPP_COMMENT = "Solid move — no immediate threat created."
+_PLAYER_GOOD_COMMENT = "Solid move — you kept the position steady and avoided giving your opponent an immediate tactical target."
+_PENDING_DETAIL_TEXT = "The detailed coach note is still being generated."
 
 
-def explain_game(moves, played_as, config, game_result='unknown'):
-    """One Claude call for the whole game. Populates 'explanation' on every move."""
+def fill_fast_comments(moves, played_as):
+    """Populate immediate local comments so the UI has useful text right away."""
+    if not moves:
+        return moves
+
+    for m in moves:
+        if m.get('explanation'):
+            continue
+
+        if m.get('color') != played_as:
+            m['explanation'] = _opponent_comment(m)
+            continue
+
+        if _needs_claude(m, played_as):
+            m['explanation'] = _quick_mistake_comment(m)
+        else:
+            m['explanation'] = _PLAYER_GOOD_COMMENT
+
+    return moves
+
+
+def needs_claude_commentary(moves, played_as):
+    """Return True when there are player mistakes worth sending to Claude."""
+    return any(_needs_claude(m, played_as) for m in moves or [])
+
+
+def finalize_fast_comments(moves, played_as):
+    """Remove temporary pending language once commentary generation is finished."""
+    for m in moves or []:
+        if (
+            _needs_claude(m, played_as)
+            and _PENDING_DETAIL_TEXT in (m.get('explanation') or '')
+        ):
+            m['explanation'] = _quick_mistake_comment(m, pending=False)
+    return moves
+
+
+def explain_game(moves, played_as, config, game_result='unknown', player_profile=None):
+    """Ask Claude only for important player mistakes; keep local notes elsewhere."""
     api_key = config.get('anthropic_api_key')
-    if not api_key or not moves:
+    if not moves:
+        return moves
+
+    fill_fast_comments(moves, played_as)
+    if not api_key or not needs_claude_commentary(moves, played_as):
         return moves
 
     client = anthropic.Anthropic(api_key=api_key)
 
-    # Pre-fill auto-generated comments for trivial opponent moves
-    skip_idxs = _auto_fill_trivial_opp(moves, played_as)
-
     try:
-        comments = _batch_comments(client, moves, played_as, game_result, skip_idxs, config)
+        comments = _batch_comments(client, moves, played_as, game_result, config, player_profile)
     except Exception as e:
         print(f"Claude batch explanation failed: {e}")
         return moves
@@ -87,83 +104,73 @@ def explain_game(moves, played_as, config, game_result='unknown'):
         idx     = item.get('idx')
         comment = item.get('comment', '').strip()
         if idx is not None and 0 <= idx < len(moves) and comment:
-            moves[idx]['explanation'] = comment
+            moves[idx]['explanation'] = _safe_claude_comment(comment, moves[idx])
 
     return moves
-
-
-def _auto_fill_trivial_opp(moves, played_as):
-    """Auto-comment routine opponent moves so Claude doesn't have to.
-
-    A move is 'trivial' (auto-filled) if it's the opponent's move AND:
-      - classified as 'best' (Stockfish confirms no big swing), AND
-      - eval swing is small (<= 30cp), AND
-      - not in the opening phase (opening moves still get real context)
-
-    Returns the set of idx values that were auto-filled (to exclude from Claude).
-    """
-    skip = set()
-    for idx, m in enumerate(moves):
-        if m['color'] == played_as:
-            continue  # always send player's own moves to Claude
-        cls   = m.get('classification', 'unknown')
-        delta = abs(m.get('delta') or 0)
-        phase = _phase(m['move_number'])
-        if phase == 'opening':
-            continue
-        if cls in ('blunder', 'mistake', 'inaccuracy'):
-            continue
-        if cls == 'best' and delta <= 30:
-            m['explanation'] = _AUTO_OPP_COMMENT
-            skip.add(idx)
-    return skip
 
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _batch_comments(client, moves, played_as, game_result, skip_idxs, config):
-    skip_idxs  = skip_idxs or set()
+def _batch_comments(client, moves, played_as, game_result, config, player_profile=None):
+    skip_idxs  = {
+        idx for idx, move in enumerate(moves)
+        if not _needs_claude(move, played_as)
+    }
     move_seq   = _build_move_sequence(moves)
     move_block = _build_move_block(moves, played_as, skip_idxs)
 
-    n_requested = sum(1 for i in range(len(moves)) if i not in skip_idxs)
+    n_requested = sum(1 for m in moves if _needs_claude(m, played_as))
     n_with_engine_data = sum(
-        1 for i, m in enumerate(moves)
-        if i not in skip_idxs and (m.get('candidates') or m.get('pv_line'))
+        1 for m in moves
+        if _needs_claude(m, played_as) and (m.get('candidates') or m.get('pv_line'))
     )
+    profile_block = f"{player_profile}\n\n" if player_profile else ""
     user_prompt = (
+        f"{profile_block}"
         f"Game: I am playing as {played_as}. Result: {game_result}.\n\n"
         f"Full move sequence (for context):\n{move_seq}\n\n"
-        f"Moves needing commentary ({n_requested} total; {n_with_engine_data} have deep Stockfish data):\n"
-        f"Stockfish evals are from WHITE's perspective in pawns.\n"
-        f"For critical positions you have: top candidate moves with evals, plus a 6-move continuation line.\n"
+        f"Player moves needing detailed commentary ({n_requested} total; {n_with_engine_data} have deep Stockfish data):\n"
+        f"All evals are from YOUR perspective as {played_as} (positive = you are better).\n"
+        f"VERIFIED FACTS for each move are machine-generated by python-chess from the exact board position — "
+        f"they are the only source you may use for piece-square claims.\n"
         f"Phase markers indicate opening/middlegame/endgame boundaries.\n\n"
         f"{move_block}\n\n"
-        f"Write a comment for every move marked [NEEDS COMMENT]. "
-        f"Do NOT write comments for moves marked [SKIP]. "
-        f"For moves with STOCKFISH DATA blocks, USE that data to write specific, concrete analysis. "
-        f"Explain the candidate moves and what the PV line demonstrates. "
-        f"Apply the phase-specific coaching standards and identify tactical motifs by name."
+        f"REMINDER: Check each mistake against the player profile above FIRST. "
+        f"If it matches a recurring pattern, say so explicitly. "
+        f"Use only the VERIFIED FACTS for any positional or tactical claims — never invent piece locations or motifs."
     )
 
     model = config.get('explain_model', 'claude-sonnet-4-6')
-    response = client.messages.create(
-        model=model,
-        max_tokens=12000,
-        system=[
+    max_tokens = min(8000, max(1200, n_requested * 450))
+
+    kwargs = {
+        'model': model,
+        'max_tokens': max_tokens,
+        'system': [
             {
                 "type": "text",
                 "text": SYSTEM_PROMPT,
                 "cache_control": {"type": "ephemeral"},
             }
         ],
-        messages=[{'role': 'user', 'content': user_prompt}],
-        timeout=240,   # 4-minute hard cap (deeper analysis takes longer)
-    )
+        'messages': [{'role': 'user', 'content': user_prompt}],
+        'timeout': config.get('explain_timeout', 180),
+    }
 
-    raw = response.content[0].text.strip()
+    # Extended thinking on Opus 4.7 — uses the new adaptive thinking API
+    # (the old `enabled` + `budget_tokens` form is rejected with HTTP 400 on this model).
+    # Lets the model verify piece locations against BOARD STATE before committing to text.
+    if 'opus' in model:
+        kwargs['max_tokens'] = max(max_tokens, 4500)
+        kwargs['thinking'] = {'type': 'adaptive'}
+        kwargs['output_config'] = {'effort': 'high'}
+
+    response = client.messages.create(**kwargs)
+
+    # With extended thinking, content[0] may be a thinking block — find the text block.
+    raw = next((b.text for b in response.content if getattr(b, 'type', None) == 'text'), '').strip()
 
     # Strip markdown fences if Claude adds them
     if raw.startswith('```'):
@@ -224,7 +231,6 @@ def _build_move_block(moves, played_as, skip_idxs=None):
         delta   = m.get('delta') or 0
 
         if idx in skip_idxs:
-            lines.append(f"[{idx}] {label}  {mn}. {san}  [SKIP]")
             continue
 
         e_before = m.get('eval_before')
@@ -242,17 +248,396 @@ def _build_move_block(moves, played_as, skip_idxs=None):
 
         lines.append(line)
 
+        fen_before = m.get('fen_before')
+        if fen_before:
+            board_state = _full_board_state(fen_before, played_as)
+            if board_state:
+                lines.append("  BOARD STATE before this move (machine-generated from FEN, 100% accurate):")
+                for bl in board_state:
+                    lines.append(f"    {bl}")
+            facts = _verified_move_facts(m, played_as)
+            if facts:
+                lines.append("  MOVE FACTS (machine-generated, 100% accurate):")
+                for fact in facts:
+                    lines.append(f"    - {fact}")
+
         # Append rich Stockfish data block for critical positions
+        # cp values are stored from WHITE's perspective; flip for black so all evals
+        # in this block match the mover's-perspective values in VERIFIED FACTS above.
         candidates = m.get('candidates', [])
         pv_line    = m.get('pv_line', [])
         if candidates or pv_line:
-            lines.append("  ── STOCKFISH DATA ──")
+            lines.append("  STOCKFISH DATA (evals from YOUR perspective; positive = you are better):")
+            cp_sign = 1 if played_as == 'white' else -1
             for rank, c in enumerate(candidates[:3], 1):
-                cp = c.get('cp', 0)
-                sign = '+' if cp >= 0 else ''
+                cp_mover = (c.get('cp', 0) or 0) * cp_sign
+                sign = '+' if cp_mover >= 0 else ''
                 pv_str = ' '.join(c.get('pv_line', [])[:4]) if c.get('pv_line') else ''
-                lines.append(f"  #{rank} candidate: {c['san']} (eval {sign}{cp/100:.1f})  continuation: {pv_str}")
+                lines.append(f"  #{rank} candidate: {c['san']} (eval {sign}{cp_mover/100:.1f})  continuation: {pv_str}")
             if pv_line and not candidates:
                 lines.append(f"  Best continuation: {' '.join(pv_line)}")
 
     return '\n'.join(lines)
+
+
+_PIECE_CHARS = {
+    chess.PAWN:   ('P', 'p'),
+    chess.KNIGHT: ('N', 'n'),
+    chess.BISHOP: ('B', 'b'),
+    chess.ROOK:   ('R', 'r'),
+    chess.QUEEN:  ('Q', 'q'),
+    chess.KING:   ('K', 'k'),
+}
+
+_PIECE_NAMES = {
+    chess.PAWN: 'pawn', chess.KNIGHT: 'knight', chess.BISHOP: 'bishop',
+    chess.ROOK: 'rook', chess.QUEEN: 'queen',   chess.KING: 'king',
+}
+
+def _piece_char(piece):
+    if piece is None:
+        return '.'
+    white_char, black_char = _PIECE_CHARS[piece.piece_type]
+    return white_char if piece.color == chess.WHITE else black_char
+
+
+def _full_board_state(fen, played_as):
+    """Return a list of plain-English lines describing every piece on the board.
+
+    Generated directly from the FEN by python-chess — guaranteed accurate.
+    Groups pieces by type so Claude can quickly locate any piece without
+    spatial grid parsing.
+    """
+    try:
+        board = chess.Board(fen)
+    except Exception:
+        return []
+
+    your_color = chess.BLACK if played_as == 'black' else chess.WHITE
+    opp_color  = not your_color
+    your_label = played_as.capitalize()
+    opp_label  = 'White' if played_as == 'black' else 'Black'
+
+    order = [chess.KING, chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT, chess.PAWN]
+
+    def piece_lines(color, label):
+        lines = []
+        for pt in order:
+            squares = sorted(board.pieces(pt, color), key=lambda s: (chess.square_rank(s), chess.square_file(s)))
+            if not squares:
+                continue
+            sq_names = ', '.join(chess.square_name(s) for s in squares)
+            count = len(squares)
+            name = _PIECE_NAMES[pt]
+            plural = name if count == 1 else name + 's'
+            lines.append(f"  {label} {plural}: {sq_names}")
+        return lines
+
+    result = [f"Your pieces ({your_label}):"]
+    result += piece_lines(your_color, '')
+    result.append(f"Opponent's pieces ({opp_label}):")
+    result += piece_lines(opp_color, '')
+    return result
+
+
+def _board_ascii(fen, played_as):
+    """Standard orientation (rank 8 top, a–h left) plus an unambiguous piece inventory."""
+    try:
+        board = chess.Board(fen)
+
+        # Board grid — always white-at-bottom so Claude reads it in its trained orientation
+        rows = ['  a b c d e f g h']
+        for rank in range(7, -1, -1):
+            row = f"{rank + 1} " + ' '.join(
+                _piece_char(board.piece_at(chess.square(f, rank))) for f in range(8)
+            )
+            rows.append(row)
+        rows.append('  a b c d e f g h')
+        rows.append(f'(White pieces uppercase · Black pieces lowercase · You are playing as {played_as})')
+
+        # Explicit piece inventory — unambiguous square names
+        your_color = chess.BLACK if played_as == 'black' else chess.WHITE
+        opp_color  = not your_color
+        your_pieces, opp_pieces = [], []
+        for sq in chess.SQUARES:
+            piece = board.piece_at(sq)
+            if piece is None:
+                continue
+            entry = f"{_PIECE_NAMES[piece.piece_type]} {chess.square_name(sq)}"
+            if piece.color == your_color:
+                your_pieces.append(entry)
+            else:
+                opp_pieces.append(entry)
+        rows.append(f"Your pieces:       {', '.join(your_pieces)}")
+        rows.append(f"Opponent's pieces: {', '.join(opp_pieces)}")
+
+        return '\n'.join(rows)
+    except Exception:
+        return ''
+
+
+def _verified_move_facts(move, played_as):
+    """Machine-checked facts Claude can safely repeat without reading the board."""
+    fen_before = move.get('fen_before')
+    if not fen_before:
+        return []
+
+    try:
+        board = chess.Board(fen_before)
+    except Exception:
+        return []
+
+    facts = []
+    mover_color = board.turn  # chess.WHITE or chess.BLACK
+
+    played_san = move.get('san')
+    played_move = _parse_san_safe(board, played_san)
+    if played_move:
+        facts.extend(_move_facts(board, played_move, f"Played move ({played_san})"))
+        board_after = board.copy()
+        board_after.push(played_move)
+        # Only report pieces that BECAME newly hanging due to this move
+        hanging_before = _hanging_squares(board, mover_color)
+        facts.extend(_after_move_facts(board_after, played_move, played_san, mover_color, hanging_before))
+
+    best_san = move.get('best_move')
+    best_move = _parse_san_safe(board, best_san)
+    if best_move:
+        # Only describe what the preferred move does — do not second-guess Stockfish by
+        # checking for hanging pieces after it (intentional sacrifices look "hanging").
+        facts.extend(_move_facts(board, best_move, f"Stockfish preferred move ({best_san})"))
+
+    e_before = move.get('eval_before')
+    e_after  = move.get('eval_after')
+    if e_before is not None and e_after is not None:
+        sb = '+' if e_before >= 0 else ''
+        sa = '+' if e_after  >= 0 else ''
+        facts.append(
+            f"Evaluation (mover's perspective) changed from {sb}{e_before/100:.1f} to {sa}{e_after/100:.1f} pawns."
+        )
+
+    delta = abs(move.get('delta') or 0)
+    if delta:
+        facts.append(f"Centipawn loss: about {delta/100:.1f} pawns.")
+
+    return facts
+
+
+def _parse_san_safe(board, san):
+    if not san:
+        return None
+    try:
+        return board.parse_san(san)
+    except Exception:
+        return None
+
+
+def _hanging_squares(board, color):
+    """Return the set of squares where `color`'s pieces are undefended and attacked."""
+    opponent = not color
+    hanging = set()
+    for sq in chess.SQUARES:
+        piece = board.piece_at(sq)
+        if piece is None or piece.color != color:
+            continue
+        if board.attackers(opponent, sq) and not board.attackers(color, sq):
+            hanging.add(sq)
+    return hanging
+
+
+def _after_move_facts(board_after, move, san, mover_color, hanging_before=None):
+    """Facts about NEWLY hanging pieces after a move (pieces that weren't already hanging)."""
+    facts = []
+    opponent_color = not mover_color
+    piece_values = {chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3,
+                    chess.ROOK: 5, chess.QUEEN: 9, chess.KING: 99}
+    hanging_before = hanging_before or set()
+
+    to_sq = move.to_square
+    moved_piece = board_after.piece_at(to_sq)
+
+    # Is the piece that just moved now hanging (and wasn't already hanging on its origin)?
+    if moved_piece and moved_piece.color == mover_color:
+        attackers = board_after.attackers(opponent_color, to_sq)
+        defenders = board_after.attackers(mover_color, to_sq)
+        if attackers and not defenders:
+            facts.append(
+                f"After {san}: the moved {_PIECE_NAMES[moved_piece.piece_type]} on "
+                f"{chess.square_name(to_sq)} is undefended and can be captured for free (hanging)."
+            )
+        elif attackers:
+            atk_vals = [piece_values.get(
+                (board_after.piece_at(a) or chess.Piece(chess.PAWN, opponent_color)).piece_type, 1)
+                for a in attackers]
+            def_vals = [piece_values.get(
+                (board_after.piece_at(d) or chess.Piece(chess.PAWN, mover_color)).piece_type, 1)
+                for d in defenders]
+            if min(atk_vals) < piece_values.get(moved_piece.piece_type, 1) and min(atk_vals) <= min(def_vals):
+                facts.append(
+                    f"After {san}: the moved {_PIECE_NAMES[moved_piece.piece_type]} on "
+                    f"{chess.square_name(to_sq)} is under attack and may be captured at a loss."
+                )
+
+    # Did this move newly expose another piece on the mover's side?
+    for sq in chess.SQUARES:
+        if sq == to_sq or sq in hanging_before:
+            continue
+        piece = board_after.piece_at(sq)
+        if piece is None or piece.color != mover_color:
+            continue
+        attackers = board_after.attackers(opponent_color, sq)
+        defenders = board_after.attackers(mover_color, sq)
+        if attackers and not defenders and piece_values.get(piece.piece_type, 1) >= 3:
+            facts.append(
+                f"After {san}: your {_PIECE_NAMES[piece.piece_type]} on "
+                f"{chess.square_name(sq)} is now undefended and attacked (newly hanging)."
+            )
+
+    if board_after.is_check():
+        facts.append(f"After {san}: the opponent's king is in check.")
+
+    return facts
+
+
+def _move_facts(board, move, label):
+    piece = board.piece_at(move.from_square)
+    if piece is None:
+        return []
+
+    piece_name = _PIECE_NAMES[piece.piece_type]
+    color_name = 'white' if piece.color == chess.WHITE else 'black'
+    from_sq = chess.square_name(move.from_square)
+    to_sq = chess.square_name(move.to_square)
+    facts = [f"{label}: {color_name} {piece_name} moves from {from_sq} to {to_sq}."]
+
+    captured = board.piece_at(move.to_square)
+    if captured:
+        captured_name = _PIECE_NAMES[captured.piece_type]
+        captured_color = 'white' if captured.color == chess.WHITE else 'black'
+        # Check whether the destination square is defended by the opponent — this
+        # determines whether the capture is a free piece or an exchange.
+        recapturers = list(board.attackers(captured.color, move.to_square))
+        if not recapturers:
+            facts.append(
+                f"{label}: it captures an UNDEFENDED {captured_color} {captured_name} on {to_sq} "
+                f"(no recapturer — this wins material outright)."
+            )
+        else:
+            recap_names = ', '.join(
+                f"{_PIECE_NAMES[(board.piece_at(s)).piece_type]} on {chess.square_name(s)}"
+                for s in recapturers
+                if board.piece_at(s) is not None
+            )
+            facts.append(
+                f"{label}: it captures a {captured_color} {captured_name} on {to_sq}, "
+                f"but {to_sq} is DEFENDED by {captured_color} {recap_names} — this is an exchange, NOT a free piece."
+            )
+    elif board.is_en_passant(move):
+        captured_sq = chess.square(chess.square_file(move.to_square), chess.square_rank(move.from_square))
+        facts.append(f"{label}: it captures en passant on {chess.square_name(captured_sq)}.")
+
+    if move.promotion:
+        facts.append(f"{label}: the pawn promotes to a {_PIECE_NAMES[move.promotion]}.")
+
+    if board.is_castling(move):
+        side = 'kingside' if chess.square_file(move.to_square) == 6 else 'queenside'
+        facts.append(f"{label}: this is {side} castling.")
+
+    if board.gives_check(move):
+        facts.append(f"{label}: this gives check.")
+
+    return facts
+
+
+def _needs_claude(move, played_as):
+    return (
+        move.get('color') == played_as
+        and move.get('classification') in ('inaccuracy', 'mistake', 'blunder')
+    )
+
+
+def _opponent_comment(move):
+    cls = move.get('classification')
+    delta = abs(move.get('delta') or 0)
+    if cls in ('blunder', 'mistake', 'inaccuracy') or delta >= 150:
+        return "Your opponent gave you a chance here — check the engine suggestion before moving on."
+    return _AUTO_OPP_COMMENT
+
+
+def _quick_mistake_comment(move, pending=True):
+    cls = move.get('classification', 'inaccuracy')
+    lost = abs(move.get('delta') or 0) / 100
+    best = move.get('best_move')
+    article = 'an' if cls[:1].lower() in 'aeiou' else 'a'
+    suffix = (
+        f" {_PENDING_DETAIL_TEXT}"
+        if pending else
+        " This is a quick Stockfish note; no deeper coach note was generated for this move."
+    )
+    if best:
+        return (
+            f"This was {article} {cls}: Stockfish preferred {best}, and the move played "
+            f"cost about {lost:.1f} pawns.{suffix}"
+        )
+    return (
+        f"This was {article} {cls}: the evaluation shifted by about {lost:.1f} pawns."
+        f"{suffix}"
+    )
+
+
+_SQUARE_RE = re.compile(r'\b[a-h][1-8]\b', re.IGNORECASE)
+
+
+_FREE_PIECE_RE = re.compile(
+    r'(?:free|simply\s+won|simply\s+wins|wins?\s+(?:a\s+|an\s+)?(?:piece|knight|bishop|rook|queen|pawn)|'
+    r'(?:hanging|undefended)\s+(?:knight|bishop|rook|queen|pawn|piece))',
+    re.IGNORECASE,
+)
+
+
+def _safe_claude_comment(comment, move):
+    """Strip comments that contradict the verified facts."""
+    if _has_extra_square_mentions(comment, move):
+        return _quick_mistake_comment(move, pending=False)
+    if _claims_free_piece_falsely(comment, move):
+        return _quick_mistake_comment(move, pending=False)
+    return comment
+
+
+def _claims_free_piece_falsely(comment, move):
+    """Reject comments claiming a free win when the captured square is actually defended."""
+    if not _FREE_PIECE_RE.search(comment or ''):
+        return False
+    fen_before = move.get('fen_before')
+    best_san = move.get('best_move')
+    if not (fen_before and best_san):
+        return False
+    try:
+        board = chess.Board(fen_before)
+        best_move = board.parse_san(best_san)
+    except Exception:
+        return False
+    if not board.is_capture(best_move):
+        # Comment claims a free piece but the suggested move isn't even a capture
+        return True
+    captured = board.piece_at(best_move.to_square)
+    if captured is None:
+        return True
+    # If the destination square is defended, the comment is wrong about "free"
+    return bool(board.attackers(captured.color, best_move.to_square))
+
+
+_SAN_SQ_RE = re.compile(r'[a-h][1-8]')   # no word boundaries — works inside SAN like Nxd2+
+
+def _has_extra_square_mentions(comment, move):
+    # Collect every square explicitly mentioned in move notation or verified facts
+    allowed = set()
+    for san in (move.get('san'), move.get('best_move')):
+        allowed.update(s.lower() for s in _SAN_SQ_RE.findall(san or ''))
+    for c in (move.get('candidates') or []):
+        allowed.update(s.lower() for s in _SAN_SQ_RE.findall(c.get('san') or ''))
+    # Comments may only mention squares that appear in allowed move notation
+    for square in _SQUARE_RE.findall(comment or ''):
+        if square.lower() not in allowed:
+            return True
+    return False

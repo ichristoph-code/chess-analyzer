@@ -6,13 +6,13 @@ import sqlite3
 import anthropic
 
 SYSTEM_PROMPT = (
-    "You are a chess coach writing a detailed, specific coaching report for a beginner player (~850 rated). "
-    "You have access to real statistics AND actual AI-generated explanations from their analyzed games. "
+    "You are a patient chess coach for a low-level adult player who wants big-picture guidance. "
+    "Stockfish has already identified the objective mistakes; your job is to turn those facts into concepts, habits, and a practice plan. "
     "Write 6 specific, actionable coaching observations as bullet points starting with •. "
-    "Reference the actual patterns you see in the sample explanations — be concrete. "
-    "Don't write generic advice like 'study tactics'. Say things like "
-    "'You frequently leave your knight undefended in the middlegame after castling' "
-    "if that's what the data shows. "
+    "Each bullet should name the recurring concept first, then explain how it showed up in the player's games. "
+    "Use beginner-friendly chess language: hanging pieces, missed threats, development, king safety, trades, pawn structure, and simple tactics. "
+    "Reference actual sample explanations when they reveal a pattern, but do not drown the player in engine lines. "
+    "Avoid generic advice like 'study tactics'; instead say exactly what habit to practice before each move. "
     "End with one short, genuinely encouraging summary sentence."
 )
 
@@ -27,7 +27,7 @@ def generate_patterns(username, db_path, config):
     if not api_key:
         return _fallback_report(stats)
 
-    model = config.get('patterns_model', 'claude-opus-4-6')
+    model = config.get('patterns_model', 'claude-sonnet-4-6')
     client = anthropic.Anthropic(api_key=api_key)
     try:
         response = client.messages.create(
@@ -221,6 +221,64 @@ def _build_prompt(s):
         "Reference the actual explanations above — look for recurring themes. Be concrete. "
         "If you see repeated tactical motifs in the blunder samples (forks, hanging pieces, pins), "
         "call them out by name. If the opening data shows a pattern, address it."
+    ]
+
+    return '\n'.join(lines)
+
+
+def get_player_weakness_summary(username, db_path, max_games=25):
+    """Return a compact text block of the player's known weakness patterns.
+
+    Used to personalise per-game Claude explanations without an extra API call.
+    Returns None when there is not enough history yet.
+    """
+    stats = _aggregate_stats(username, db_path)
+    if not stats or stats['total_games'] < 3:
+        return None
+
+    piece_names = {'N': 'knight', 'B': 'bishop', 'R': 'rook', 'Q': 'queen', 'K': 'king', 'P': 'pawn'}
+    worst_phase = max(stats['phase'], key=stats['phase'].get)
+    ph = stats['phase']
+
+    lines = [
+        f"=== THIS PLAYER'S RECURRING WEAKNESSES (across {stats['total_games']} analyzed games) ===",
+        f"Win rate: {stats['win_rate']}%  |  {stats['avg_blunders_per_game']} blunders/game on average",
+        f"Blunders by phase — Opening: {ph['opening']}, Middlegame: {ph['middlegame']}, Endgame: {ph['endgame']}  →  most errors in the {worst_phase}",
+    ]
+
+    if stats['piece_blunders']:
+        sorted_pieces = sorted(stats['piece_blunders'].items(), key=lambda x: -x[1])
+        lines.append("Most blundered pieces: " +
+                     ', '.join(f"{piece_names.get(p, p)} ({n}×)" for p, n in sorted_pieces[:4]))
+
+    w = stats['color_stats']['white']
+    b = stats['color_stats']['black']
+    if w['total'] and b['total']:
+        lines.append(
+            f"As white: {round(w['wins']/w['total']*100)}% win rate  |  "
+            f"As black: {round(b['wins']/b['total']*100)}% win rate"
+        )
+
+    recent_blunders = stats['blunder_samples'][:8]
+    if recent_blunders:
+        lines.append("")
+        lines.append("Recent blunder patterns (use these to identify if the current mistake is recurring):")
+        for b_sample in recent_blunders:
+            lines.append(f"  • {b_sample}")
+
+    recent_mistakes = stats['mistake_samples'][:5]
+    if recent_mistakes:
+        lines.append("")
+        lines.append("Recent mistake patterns:")
+        for m_sample in recent_mistakes:
+            lines.append(f"  • {m_sample}")
+
+    lines += [
+        "",
+        "If the move being explained matches a recurring pattern above, explicitly say so: "
+        "'This is another instance of your tendency to...' or 'You've made this type of error N times recently.'",
+        "If it's a new type of error, note that too.",
+        "=== END PLAYER PROFILE ===",
     ]
 
     return '\n'.join(lines)

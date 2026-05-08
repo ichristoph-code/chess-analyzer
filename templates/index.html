@@ -11,6 +11,7 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="apple-mobile-web-app-title" content="Chess">
   <meta name="theme-color" content="#1a1a2e">
+  <link rel="apple-touch-icon" href="/static/img/icon-192.png">
 
   <link rel="stylesheet" href="/static/css/style.css">
 </head>
@@ -20,10 +21,17 @@
 
   <!-- Nav bar -->
   <nav id="nav">
+    <button id="btn-mobile-games" onclick="toggleMobileGames()" aria-expanded="false" aria-controls="game-list-panel">Games</button>
     <h1>♟ Ian's Chess Analyzer</h1>
     <div id="nav-actions">
+      <div id="model-switch" role="group" aria-label="Coach model">
+        <button id="model-sonnet" onclick="setCoachModel('sonnet')" title="Use cheaper Sonnet model">Sonnet</button>
+        <button id="model-opus" onclick="setCoachModel('opus')" title="Use richer Opus model">Opus</button>
+      </div>
       <button id="btn-fetch" onclick="fetchGames()">↓ Fetch</button>
+      <button id="btn-redo-commentary" onclick="redoCommentary()" title="Re-run Claude commentary for this game" style="display:none">↻ Refresh Commentary</button>
       <button id="btn-reanalyze-all" onclick="reAnalyzeAll()" title="Re-analyze all games with new settings">↺ Re-analyze All</button>
+      <button id="btn-refresh-commentary" onclick="refreshAllCommentary()" title="Re-run Claude commentary on all games (keeps Stockfish data, much faster)">↻ Refresh All</button>
     </div>
   </nav>
 
@@ -143,5 +151,10 @@
 </div><!-- /app -->
 
 <script src="/static/js/app.js"></script>
+<script>
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js'));
+  }
+</script>
 </body>
 </html>
