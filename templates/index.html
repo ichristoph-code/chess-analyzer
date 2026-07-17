@@ -3,6 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
   <title>Ian's Chess Analyzer</title>
 
   <!-- PWA -->
@@ -21,17 +22,21 @@
 
   <!-- Nav bar -->
   <nav id="nav">
-    <button id="btn-mobile-games" onclick="toggleMobileGames()" aria-expanded="false" aria-controls="game-list-panel">Games</button>
-    <h1>♟ Ian's Chess Analyzer</h1>
+    <h1><span class="nav-knight">♞</span> Ian's Chess Analyzer</h1>
     <div id="nav-actions">
       <div id="model-switch" role="group" aria-label="Coach model">
         <button id="model-sonnet" onclick="setCoachModel('sonnet')" title="Use cheaper Sonnet model">Sonnet</button>
         <button id="model-opus" onclick="setCoachModel('opus')" title="Use richer Opus model">Opus</button>
       </div>
       <button id="btn-fetch" onclick="fetchGames()">↓ Fetch</button>
-      <button id="btn-redo-commentary" onclick="redoCommentary()" title="Re-run Claude commentary for this game" style="display:none">↻ Refresh Commentary</button>
-      <button id="btn-reanalyze-all" onclick="reAnalyzeAll()" title="Re-analyze all games with new settings">↺ Re-analyze All</button>
-      <button id="btn-refresh-commentary" onclick="refreshAllCommentary()" title="Re-run Claude commentary on all games (keeps Stockfish data, much faster)">↻ Refresh All</button>
+      <div id="nav-menu-wrap">
+        <button id="btn-nav-menu" onclick="toggleNavMenu()" aria-haspopup="true" aria-expanded="false" title="More actions">⋯</button>
+        <div id="nav-menu" role="menu">
+          <button id="btn-redo-commentary" onclick="toggleNavMenu(false); redoCommentary()" title="Re-run Claude commentary for this game (keeps Stockfish data)" style="display:none">↻ Refresh commentary — this game</button>
+          <button id="btn-refresh-commentary" onclick="toggleNavMenu(false); refreshAllCommentary()" title="Re-run Claude commentary on all games (keeps Stockfish data)">↻ Refresh commentary — all games</button>
+          <button id="btn-reanalyze-all" onclick="toggleNavMenu(false); reAnalyzeAll()" title="Re-run Stockfish + Claude on every game">↺ Re-analyze all games</button>
+        </div>
+      </div>
     </div>
   </nav>
 
@@ -68,12 +73,20 @@
       </div>
     </div>
 
+    <!-- ── Resize handle: left ───────────────────────────── -->
+    <div class="col-resize-handle" id="resize-handle-left" title="Drag to resize"></div>
+
     <!-- ── Center: Board + moves ───────────────────────────── -->
     <div id="board-panel">
 
       <div id="placeholder">
-        <div class="icon">♟</div>
-        <p>Select a game from the list to start</p>
+        <div class="icon">♞</div>
+        <p>Select a game to start reviewing</p>
+        <div class="placeholder-hints">
+          <span><kbd>←</kbd><kbd>→</kbd> step moves</span>
+          <span><kbd>[</kbd><kbd>]</kbd> jump to mistakes</span>
+          <span><kbd>F</kbd> flip board</span>
+        </div>
       </div>
 
       <div id="game-view" style="display:none">
@@ -91,6 +104,8 @@
             <span id="move-counter">— / —</span>
             <button onclick="stepMove(1)" title="Next move">→</button>
             <button onclick="goToLastMove()" title="Jump to end">⇥</button>
+            <button onclick="jumpToMistake(-1)" title="Previous mistake ( [ key )">‹?</button>
+            <button onclick="jumpToMistake(1)" title="Next mistake ( ] key )">?›</button>
             <button onclick="flipBoard()" title="Flip board" id="btn-flip">⇅</button>
           </div>
           <div id="commentary-banner" style="display:none">
@@ -98,8 +113,8 @@
             Generating Claude commentary…
           </div>
           <div id="analysis-error" style="display:none">
-            <span>⚠ Commentary failed</span>
-            <button onclick="reAnalyzeGame()">Retry</button>
+            <span>⚠ Claude commentary failed</span>
+            <button onclick="redoCommentary()">Retry</button>
           </div>
           <div id="move-list"></div>
         </div>
@@ -111,6 +126,9 @@
       </div>
     </div>
 
+    <!-- ── Resize handle: right ──────────────────────────── -->
+    <div class="col-resize-handle" id="resize-handle-right" title="Drag to resize"></div>
+
     <!-- ── Right: Analysis panel ───────────────────────────── -->
     <div id="analysis-panel">
       <div id="analysis-header">
@@ -121,6 +139,17 @@
         <div id="game-opening-label"></div>
         <button id="btn-reanalyze" onclick="reAnalyzeGame()" title="Re-analyze this game with current settings" style="display:none">↺ Re-analyze</button>
       </div>
+      <div id="game-overview-section" style="display:none">
+        <div id="game-overview-header" onclick="toggleGameOverview()">
+          <span>Game Overview</span>
+          <span id="game-overview-chevron">▲</span>
+        </div>
+        <div id="game-overview-body">
+          <div id="game-stats-row" style="display:none"></div>
+          <div id="game-overview-text" class="muted"></div>
+        </div>
+      </div>
+
       <div id="analysis-body">
         <div id="analysis-coach-label">Coach</div>
         <div id="analysis-comment" class="muted">
@@ -148,9 +177,26 @@
 
 
   </div><!-- /main -->
+
+  <!-- Mobile bottom tab bar (hidden on desktop via CSS) -->
+  <nav id="mobile-tab-bar">
+    <button id="tab-btn-games"    class="tab-btn" onclick="setMobileTab('games')">
+      <span class="tab-icon">☰</span>
+      <span class="tab-label">Games</span>
+    </button>
+    <button id="tab-btn-board"    class="tab-btn" onclick="setMobileTab('board')">
+      <span class="tab-icon">♟</span>
+      <span class="tab-label">Board</span>
+    </button>
+    <button id="tab-btn-analysis" class="tab-btn" onclick="setMobileTab('analysis')">
+      <span class="tab-icon">★</span>
+      <span class="tab-label">Analysis</span>
+    </button>
+  </nav>
+
 </div><!-- /app -->
 
-<script src="/static/js/app.js"></script>
+<script src="/static/js/app.js?v={{ static_version }}"></script>
 <script>
   if ('serviceWorker' in navigator) {
     window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js'));

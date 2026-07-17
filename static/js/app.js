@@ -72,34 +72,64 @@ function uciSqToIdx(sq) {
 }
 
 // Return {fromIdx, toIdx} for the piece that moved between two FEN positions.
+// Handles the multi-square cases: castling (two pieces move — show the king's
+// move) and en passant (three squares change).
 function computeActualMove(fenBefore, fenAfter) {
   const before = fenToArray(fenBefore);
   const after  = fenToArray(fenAfter);
-  let fromIdx = -1, toIdx = -1;
+  const vacated = [];   // squares a piece left
+  const arrived = [];   // squares a piece appeared on or changed
   for (let i = 0; i < 64; i++) {
-    if (before[i] !== after[i]) {
-      if (before[i] !== null && after[i] === null) fromIdx = i; // piece left
-      else if (before[i] === null && after[i] !== null) toIdx = i; // piece arrived
+    if (before[i] === after[i]) continue;
+    if (after[i] === null) vacated.push(i);
+    else arrived.push(i);
+  }
+  if (!vacated.length || !arrived.length) return null;
+
+  // Castling: the king and a rook both move — prefer the king's from/to.
+  if (vacated.length === 2 && arrived.length === 2) {
+    const kingFrom = vacated.find(i => before[i] === 'K' || before[i] === 'k');
+    const kingTo   = arrived.find(i => after[i]  === 'K' || after[i]  === 'k');
+    if (kingFrom !== undefined && kingTo !== undefined) {
+      return { fromIdx: kingFrom, toIdx: kingTo };
     }
   }
-  // Capture: to-square had an enemy piece (not empty) before the move
-  if (fromIdx >= 0 && toIdx < 0) {
-    for (let i = 0; i < 64; i++) {
-      if (i !== fromIdx && before[i] !== after[i] && after[i] !== null) { toIdx = i; break; }
-    }
-  }
-  return (fromIdx >= 0 && toIdx >= 0) ? { fromIdx, toIdx } : null;
+
+  // Normal move / capture / en passant: match the arriving piece to the square
+  // that piece left (promotion won't match letters, so fall back to first pair).
+  const toIdx   = arrived[0];
+  const fromIdx = vacated.find(i => before[i] === after[toIdx]) ?? vacated[0];
+  return { fromIdx, toIdx };
 }
 
-// Draw the suggestion (green) and optionally the actual-move (gray) arrows
-// on a single SVG overlay. Pass actualMove={fromIdx,toIdx} or null.
-function drawMoveArrows(suggestedUci, actualMove, orientation) {
+// Draw move arrows on a single SVG overlay.
+//
+// Actual-move arrow colour matches the move-list button colour:
+//   • Blue   — played move IS the engine's top choice (isMatch)
+//   • Red    — blunder (??)
+//   • Orange — mistake (?)
+//   • Yellow — inaccuracy
+//   • Grey   — opponent move or unknown classification
+//
+// The engine-suggestion arrow is always green when it differs from what was played.
+//
+// classification: the move's Stockfish classification string, or null for opponent moves.
+function drawMoveArrows(suggestedUci, actualMove, orientation, classification) {
   const existing = document.getElementById('best-move-svg');
   if (existing) existing.remove();
 
   const hasSuggested = suggestedUci && suggestedUci.length >= 4;
   const hasActual    = actualMove && actualMove.fromIdx >= 0 && actualMove.toIdx >= 0;
   if (!hasSuggested && !hasActual) return;
+
+  // Detect whether the played move is the engine's top choice.
+  // If so, we collapse both arrows into one blue arrow instead of grey + green.
+  let isMatch = false;
+  if (hasSuggested && hasActual) {
+    const sfFrom = uciSqToIdx(suggestedUci.slice(0, 2));
+    const sfTo   = uciSqToIdx(suggestedUci.slice(2, 4));
+    isMatch = sfFrom === actualMove.fromIdx && sfTo === actualMove.toIdx;
+  }
 
   const NS  = 'http://www.w3.org/2000/svg';
   const svg = document.createElementNS(NS, 'svg');
@@ -124,8 +154,27 @@ function drawMoveArrows(suggestedUci, actualMove, orientation) {
     m.appendChild(p);
     defs.appendChild(m);
   }
-  if (hasActual)    makeMarker('actual-head', 'rgba(200,200,200,0.8)');
-  if (hasSuggested) makeMarker('sf-head',     'rgba(34,197,94,0.92)');
+
+  // Pick the actual-move arrow colour based on classification.
+  // isMatch (blue) takes priority — if you played the engine's top move it's always blue.
+  const ACTUAL_COLORS = {
+    blunder:    ['rgba(239,68,68,0.90)',  'rgba(239,68,68,0.35)'],   // red
+    mistake:    ['rgba(249,115,22,0.90)', 'rgba(249,115,22,0.35)'],  // orange
+    inaccuracy: ['rgba(250,204,21,0.90)', 'rgba(250,204,21,0.30)'],  // yellow
+    _blue:      ['rgba(96,165,250,0.90)', 'rgba(96,165,250,0.40)'],  // blue (isMatch)
+    _grey:      ['rgba(200,200,200,0.65)','rgba(200,200,200,0.30)'], // grey (opponent/unknown)
+  };
+
+  const actualKey   = isMatch ? '_blue' : (ACTUAL_COLORS[classification] ? classification : '_grey');
+  const [actualStroke, actualFill] = ACTUAL_COLORS[actualKey];
+  const actualHeadColor = actualStroke.replace(/[\d.]+\)$/, '0.95)'); // fully opaque for arrowhead
+
+  if (isMatch) {
+    makeMarker('actual-head', actualHeadColor);
+  } else {
+    if (hasActual)    makeMarker('actual-head', actualHeadColor);
+    if (hasSuggested) makeMarker('sf-head', 'rgba(34,197,94,0.92)');  // green suggestion
+  }
   svg.appendChild(defs);
 
   function addArrow(fromIdx, toIdx, strokeColor, circColor, markerId) {
@@ -153,22 +202,17 @@ function drawMoveArrows(suggestedUci, actualMove, orientation) {
     svg.appendChild(line);
   }
 
-  // Draw actual move first (behind), suggestion on top
+  // Actual-move arrow (always drawn when we have FEN data)
   if (hasActual) {
-    addArrow(actualMove.fromIdx, actualMove.toIdx,
-      'rgba(200,200,200,0.65)', 'rgba(200,200,200,0.35)', 'actual-head');
+    addArrow(actualMove.fromIdx, actualMove.toIdx, actualStroke, actualFill, 'actual-head');
   }
-  if (hasSuggested) {
+  // Green engine suggestion on top (only when it differs from actual)
+  if (hasSuggested && !isMatch) {
     addArrow(uciSqToIdx(suggestedUci.slice(0, 2)), uciSqToIdx(suggestedUci.slice(2, 4)),
-      'rgba(34,197,94,0.85)', 'rgba(34,197,94,0.45)', 'sf-head');
+      'rgba(34,197,94,0.85)', 'rgba(34,197,94,0.40)', 'sf-head');
   }
 
   document.getElementById('board').appendChild(svg);
-}
-
-// Backwards-compat wrapper used by any remaining direct callers
-function drawBestMoveArrow(bestMoveUci, orientation) {
-  drawMoveArrows(bestMoveUci, null, orientation);
 }
 
 // ---------------------------------------------------------------------------
@@ -188,7 +232,7 @@ function renderBoard(fen, orientation, highlightSquares) {
     ? Array.from({length: 64}, (_, i) => 63 - i)
     : Array.from({length: 64}, (_, i) => i);
 
-  for (const sqIdx of order) {
+  order.forEach((sqIdx, vi) => {
     const rank = Math.floor(sqIdx / 8);  // 0 = rank 8 (top), 7 = rank 1 (bottom)
     const file = sqIdx % 8;              // 0 = file a (left), 7 = file h (right)
 
@@ -204,13 +248,29 @@ function renderBoard(fen, orientation, highlightSquares) {
       (isLight ? ' light' : ' dark') +
       (isHL    ? ' highlight' : '');
 
+    // Coordinate labels along the left edge (ranks) and bottom edge (files),
+    // based on the VISUAL position (vi) so they follow board orientation.
+    const visCol = vi % 8, visRow = Math.floor(vi / 8);
+    if (visCol === 0) {
+      const lbl = document.createElement('span');
+      lbl.className   = 'coord coord-rank';
+      lbl.textContent = 8 - rank;
+      sq.appendChild(lbl);
+    }
+    if (visRow === 7) {
+      const lbl = document.createElement('span');
+      lbl.className   = 'coord coord-file';
+      lbl.textContent = 'abcdefgh'[file];
+      sq.appendChild(lbl);
+    }
+
     const piece = pieces[sqIdx];
     if (piece) {
       sq.appendChild(pieceImg(piece));
     }
 
     el.appendChild(sq);
-  }
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -228,32 +288,104 @@ let pollTimer        = null;     // setInterval handle while waiting for backgro
 
 document.addEventListener('DOMContentLoaded', () => {
   syncMobileViewportHeight();
-  window.addEventListener('resize', syncMobileViewportHeight);
+  window.addEventListener('resize', () => { syncMobileViewportHeight(); ensureMobileTab(); });
   window.addEventListener('orientationchange', syncMobileViewportHeight);
+
+  // Initialize mobile tab layout — starts on Games tab so user picks a game first
+  if (isMobileLayout()) setMobileTab('games');
+
+  // Swipe left/right on the board to navigate moves (mobile)
+  const boardContainer = document.getElementById('board-container');
+  if (boardContainer) {
+    let swipeStartX = 0;
+    let swipeStartY = 0;
+    boardContainer.addEventListener('touchstart', e => {
+      swipeStartX = e.touches[0].clientX;
+      swipeStartY = e.touches[0].clientY;
+    }, { passive: true });
+    boardContainer.addEventListener('touchend', e => {
+      if (!currentGame || !currentGame.moves) return;
+      const dx = e.changedTouches[0].clientX - swipeStartX;
+      const dy = e.changedTouches[0].clientY - swipeStartY;
+      // Only respond to swipes that are more horizontal than vertical, and >35px
+      if (Math.abs(dx) > 35 && Math.abs(dx) > Math.abs(dy) * 1.5) {
+        if (dx < 0) stepMove(1);   // swipe left → next move
+        else        stepMove(-1);  // swipe right → prev move
+      }
+    }, { passive: true });
+  }
 
   renderBoard(STARTING_FEN, 'white', null);
   loadCoachModel();
   loadGameList();
   loadCoach();
 
-  // Wire up eval graph click-to-seek
+  // Wire up eval graph: click to seek, hover for a move/eval tooltip
   const canvas = document.getElementById('eval-graph');
   if (canvas) {
+    const moveIdxAtEvent = e => {
+      const rect = canvas.getBoundingClientRect();
+      const x    = e.clientX - rect.left;
+      const n    = currentGame.moves.length;
+      return Math.min(n - 1, Math.max(0, Math.floor(x / (rect.width / n))));
+    };
+
     canvas.addEventListener('click', e => {
       if (!currentGame || !currentGame.moves) return;
-      const rect  = canvas.getBoundingClientRect();
-      const x     = e.clientX - rect.left;
-      const n     = currentGame.moves.length;
-      const idx   = Math.min(n - 1, Math.max(0, Math.floor(x / (rect.width / n))));
-      goToMove(idx + 1);
+      goToMove(moveIdxAtEvent(e) + 1);
     });
+
+    const tip = document.createElement('div');
+    tip.id = 'eval-tooltip';
+    document.body.appendChild(tip);
+
+    canvas.addEventListener('mousemove', e => {
+      if (!currentGame || !currentGame.moves) { tip.style.display = 'none'; return; }
+      const idx = moveIdxAtEvent(e);
+      const m   = currentGame.moves[idx];
+      if (!m) { tip.style.display = 'none'; return; }
+
+      const dot  = m.color === 'black' ? '…' : '.';
+      let evalTxt = '';
+      if (m.eval_after !== null && m.eval_after !== undefined) {
+        // eval_after is mover-POV — normalise to white's POV for a stable axis
+        const cp = m.color === 'black' ? -m.eval_after : m.eval_after;
+        evalTxt  = ` · ${cp >= 0 ? '+' : ''}${(cp / 100).toFixed(1)}`;
+      }
+      const cls = (m.color === currentGame.played_as &&
+                   ['inaccuracy', 'mistake', 'blunder'].includes(m.classification))
+        ? ` · ${m.classification}` : '';
+
+      tip.textContent    = `${m.move_number}${dot} ${m.san}${evalTxt}${cls}`;
+      tip.style.display  = 'block';
+      const rect = canvas.getBoundingClientRect();
+      const tw   = tip.offsetWidth;
+      tip.style.left = Math.min(window.innerWidth - tw - 8, Math.max(8, e.clientX - tw / 2)) + 'px';
+      tip.style.top  = (rect.top - tip.offsetHeight - 6) + 'px';
+    });
+
+    canvas.addEventListener('mouseleave', () => { tip.style.display = 'none'; });
   }
 
   document.addEventListener('keydown', e => {
-    if (e.key === 'ArrowLeft')  stepMove(-1);
-    if (e.key === 'ArrowRight') stepMove(1);
-    if (e.key === 'ArrowUp')    goToMove(0);
-    if (e.key === 'ArrowDown')  goToLastMove();
+    // Don't hijack keys while the user is typing (e.g. in the chat input)
+    const tag = e.target && e.target.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+    if (!currentGame || !currentGame.moves) return;
+    const actions = {
+      'ArrowLeft':  () => stepMove(-1),
+      'ArrowRight': () => stepMove(1),
+      'ArrowUp':    () => goToMove(0),
+      'ArrowDown':  () => goToLastMove(),
+      '[':          () => jumpToMistake(-1),
+      ']':          () => jumpToMistake(1),
+      'f':          () => flipBoard(),
+    };
+    const action = actions[e.key];
+    if (action) {
+      e.preventDefault();   // arrow keys would otherwise also scroll the page
+      action();
+    }
   });
 });
 
@@ -309,20 +441,53 @@ async function setCoachModel(mode) {
 }
 
 async function loadGameList() {
-  const res   = await fetch('/api/games');
-  const games = await res.json();
-  renderGameList(games);
+  try {
+    const res   = await fetch('/api/games');
+    const games = await res.json();
+    renderGameList(games);
+  } catch (e) {
+    // The PWA shell loads from the service-worker cache even when the server
+    // is down — without this, the app looks alive but nothing works.
+    console.warn('Game list unavailable:', e);
+    document.getElementById('game-list').innerHTML = `
+      <div class="empty-state">
+        <div class="empty-state-icon">⚠︎</div>
+        <p>Server not reachable</p>
+        <p class="empty-state-hint">Start the Chess Analyzer server, then
+          <a href="#" onclick="location.reload(); return false">reload</a>.</p>
+      </div>`;
+  }
+}
+
+// Compact human date: "Today", "Yesterday", "Mon", or "Jun 12" / "Jun 12 '25".
+function relativeDate(epochSeconds) {
+  if (!epochSeconds) return '';
+  const d   = new Date(epochSeconds * 1000);
+  const now = new Date();
+  const startOfDay = dt => new Date(dt.getFullYear(), dt.getMonth(), dt.getDate());
+  const days = Math.round((startOfDay(now) - startOfDay(d)) / 86400000);
+  if (days === 0) return 'Today';
+  if (days === 1) return 'Yesterday';
+  if (days < 7)   return d.toLocaleDateString(undefined, { weekday: 'short' });
+  const opts = { month: 'short', day: 'numeric' };
+  if (d.getFullYear() !== now.getFullYear()) opts.year = '2-digit';
+  return d.toLocaleDateString(undefined, opts);
 }
 
 function renderGameList(games) {
   const el = document.getElementById('game-list');
   if (!games.length) {
-    el.innerHTML = '<div style="padding:20px;color:var(--muted);font-size:13px">No games yet — press "↓ Fetch"</div>';
+    el.innerHTML = `
+      <div class="empty-state">
+        <div class="empty-state-icon">♞</div>
+        <p>No games yet</p>
+        <p class="empty-state-hint">Press <strong>↓ Fetch</strong> to pull your recent games from chess.com</p>
+      </div>`;
     return;
   }
 
   el.innerHTML = games.map(g => {
-    const date     = g.end_time ? new Date(g.end_time * 1000).toLocaleDateString() : '';
+    const date     = relativeDate(g.end_time);
     const analyzed = g.analyzed ? '<span class="analyzed-dot" title="Analyzed"></span>' : '';
     const opening  = g.opening  ? `<div class="game-opening">${escHtml(g.opening)}</div>` : '';
     const actionLabel = g.analyzed ? '↺' : 'Analyze';
@@ -333,7 +498,8 @@ function renderGameList(games) {
           <span class="result-badge result-${g.result}">${g.result.toUpperCase()}</span>
           <span class="game-opponent">${escHtml(g.opponent)}</span>
           ${analyzed}
-          <button class="game-analyze-btn" onclick="analyzeGameFromList(event, '${g.id}')" title="${actionTitle}">
+          <button class="game-analyze-btn" data-analyzed="${g.analyzed ? 1 : 0}"
+            onclick="analyzeGameFromList(event, '${g.id}')" title="${actionTitle}">
             ${actionLabel}
           </button>
         </div>
@@ -351,20 +517,69 @@ function isMobileLayout() {
   return window.matchMedia('(max-width: 900px)').matches;
 }
 
-function setMobileGamesVisible(visible) {
-  const panel = document.getElementById('game-list-panel');
-  const btn = document.getElementById('btn-mobile-games');
-  if (!panel || !btn) return;
-  panel.classList.toggle('show-mobile', visible);
-  btn.setAttribute('aria-expanded', visible ? 'true' : 'false');
-  document.body.classList.toggle('mobile-games-open', visible);
+// When the window crosses from desktop into the mobile layout mid-session,
+// no panel has .mobile-active yet and everything would be hidden — pick a
+// sensible tab so the UI never goes blank.
+function ensureMobileTab() {
+  if (!isMobileLayout()) return;
+  const anyActive = document.querySelector(
+    '#game-list-panel.mobile-active, #board-panel.mobile-active, #analysis-panel.mobile-active');
+  if (!anyActive) setMobileTab(currentGame ? 'board' : 'games');
 }
 
-function toggleMobileGames() {
+// ---------------------------------------------------------------------------
+// Mobile tab navigation
+// ---------------------------------------------------------------------------
+
+let _currentMobileTab = 'games';
+
+// Switch to a named tab ('games', 'board', 'analysis') on mobile.
+// Also redraws the eval graph when returning to the board tab so it
+// picks up the correct canvas dimensions.
+function setMobileTab(tab) {
   if (!isMobileLayout()) return;
-  const panel = document.getElementById('game-list-panel');
-  setMobileGamesVisible(!panel.classList.contains('show-mobile'));
+
+  _currentMobileTab = tab;
+
+  // Update tab button highlight
+  ['games', 'board', 'analysis'].forEach(t => {
+    const btn = document.getElementById(`tab-btn-${t}`);
+    if (btn) btn.classList.toggle('active', t === tab);
+  });
+
+  // Show only the active panel
+  const panelIds = { games: 'game-list-panel', board: 'board-panel', analysis: 'analysis-panel' };
+  Object.entries(panelIds).forEach(([t, id]) => {
+    const el = document.getElementById(id);
+    if (el) el.classList.toggle('mobile-active', t === tab);
+  });
+
+  // Redraw eval graph — canvas dimensions change when the board panel becomes visible
+  if (tab === 'board' && currentGame && currentGame.moves) {
+    requestAnimationFrame(() => {
+      drawEvalGraph(currentGame.moves, currentGame.played_as, currentMoveIdx);
+    });
+  }
 }
+
+// ---------------------------------------------------------------------------
+// Nav overflow menu (bulk actions)
+// ---------------------------------------------------------------------------
+
+function toggleNavMenu(force) {
+  const menu = document.getElementById('nav-menu');
+  const btn  = document.getElementById('btn-nav-menu');
+  if (!menu) return;
+  const open = force !== undefined ? force : !menu.classList.contains('open');
+  menu.classList.toggle('open', open);
+  if (btn) btn.setAttribute('aria-expanded', String(open));
+}
+
+// Close the menu when clicking anywhere outside it
+document.addEventListener('click', e => {
+  const wrap = document.getElementById('nav-menu-wrap');
+  if (wrap && !wrap.contains(e.target)) toggleNavMenu(false);
+});
 
 async function fetchGames() {
   const btn = document.getElementById('btn-fetch');
@@ -393,7 +608,7 @@ async function loadGame(gameId) {
   document.querySelectorAll('.game-item').forEach(el => {
     el.classList.toggle('active', el.dataset.id === gameId);
   });
-  if (isMobileLayout()) setMobileGamesVisible(false);
+  if (isMobileLayout()) setMobileTab('board');
 
   stopPolling();
 
@@ -402,13 +617,19 @@ async function loadGame(gameId) {
   document.getElementById('placeholder').style.display      = 'none';
   document.getElementById('game-view').style.display        = 'none';
   document.getElementById('analyzing-banner').style.display = 'flex';
-  document.getElementById('analyzing-banner').querySelector('span + *') &&
-    (document.getElementById('analyzing-banner').lastChild.textContent = 'Analyzing with Stockfish…');
   document.getElementById('move-list').innerHTML            = '';
   clearExplanation();
 
-  const res  = await fetch(`/api/game/${gameId}`);
-  const game = await res.json();
+  let game;
+  try {
+    const res = await fetch(`/api/game/${gameId}`);
+    game = await res.json();
+  } catch (e) {
+    document.getElementById('analyzing-banner').style.display = 'none';
+    document.getElementById('placeholder').style.display      = '';
+    toast('Could not load game — is the server running?');
+    return;
+  }
   currentGame = game;
 
   boardOrientation = game.played_as === 'black' ? 'black' : 'white';
@@ -430,9 +651,10 @@ async function loadGame(gameId) {
 
 async function checkAnalysisStatus(gameId) {
   // Poll until Stockfish analysis is complete (analyzed=1)
-  const res  = await fetch(`/api/game/${gameId}/status`);
-  const data = await res.json();
-  if (data.analyzed) {
+  try {
+    const res  = await fetch(`/api/game/${gameId}/status`);
+    const data = await res.json();
+    if (!data.analyzed) return;
     stopPolling();
     playChime();
     loadGameList();
@@ -444,19 +666,31 @@ async function checkAnalysisStatus(gameId) {
     if (game2.commentary_pending) {
       pollTimer = setInterval(() => checkCommentaryStatus(gameId), 5000);
     }
+  } catch (e) {
+    // transient network error (e.g. server reloading) — keep polling
+    console.warn('Status poll failed:', e);
   }
 }
 
 async function checkCommentaryStatus(gameId) {
-  // Poll until Claude commentary is ready (claude_ok=1)
-  const res  = await fetch(`/api/game/${gameId}`);
-  const game = await res.json();
-  if (!game.commentary_pending && game.claude_ok) {
+  // Poll until Claude commentary is ready — or until the server gives up
+  // (commentary_pending goes false with claude_ok still 0).
+  try {
+    const res  = await fetch(`/api/game/${gameId}`);
+    const game = await res.json();
+    if (game.commentary_pending) return;
     stopPolling();
-    playChime();
-    // Update move explanations in currentGame and refresh display
     currentGame = game;
-    updateCommentary(game.moves);
+    if (game.claude_ok) {
+      playChime();
+      updateCommentary(game.moves);
+    } else {
+      // Server exhausted its retries — show the failed state with a retry button
+      document.getElementById('commentary-banner').style.display = 'none';
+      document.getElementById('analysis-error').style.display    = 'flex';
+    }
+  } catch (e) {
+    console.warn('Commentary poll failed:', e);
   }
 }
 
@@ -469,6 +703,8 @@ function updateCommentary(moves) {
   }
   // Hide commentary-loading indicator
   document.getElementById('commentary-banner').style.display = 'none';
+  // Update game overview now that the summary has arrived
+  renderGameOverview(currentGame);
 }
 
 function playChime() {
@@ -529,10 +765,14 @@ function renderGame(game) {
     commentaryBanner.style.display = game.commentary_pending ? 'flex' : 'none';
   }
 
-  // Warning if Claude failed (no explanations at all and not pending)
-  const hasExplanations = game.moves.some(m => m.explanation);
-  document.getElementById('analysis-error').style.display =
-    (hasExplanations || game.commentary_pending) ? 'none' : 'flex';
+  // Warning if Claude commentary failed and the server has stopped retrying.
+  // (Fast Stockfish comments fill every move, so "any explanation exists" can't
+  // detect failure — claude_ok is the real signal.)
+  const commentaryFailed = game.claude_ok === false && !game.commentary_pending;
+  document.getElementById('analysis-error').style.display = commentaryFailed ? 'flex' : 'none';
+
+  // Game overview
+  renderGameOverview(game);
 
   // Draw eval graph — defer one frame so the canvas has real layout dimensions
   requestAnimationFrame(() => {
@@ -572,17 +812,21 @@ function flipBoard() {
       if (move.fen_before) hl = changedSquares(move.fen_before, move.fen);
     }
   }
-  let actualMove = null;
+  let actualMove     = null;
+  let classification = null;
   if (currentGame && currentGame.moves && currentMoveIdx > 0) {
     const moves = currentGame.moves;
     const m = moves[currentMoveIdx - 1];
     bmUci = m ? (m.best_move_uci || null) : null;
-    if (bmUci && m.classification !== 'best' && m.fen_before && m.fen) {
+    if (m && m.fen_before && m.fen) {
       actualMove = computeActualMove(m.fen_before, m.fen);
+    }
+    if (m && currentGame && m.color === currentGame.played_as) {
+      classification = m.classification || null;
     }
   }
   renderBoard(fen, boardOrientation, hl);
-  drawMoveArrows(bmUci, actualMove, boardOrientation);
+  drawMoveArrows(bmUci, actualMove, boardOrientation, classification);
 }
 
 // ---------------------------------------------------------------------------
@@ -610,7 +854,7 @@ function renderMoveList(moves, playedAs) {
     } else {
       if (!pairOpen) {
         // Black moved first (rare, e.g. game loaded mid-way)
-        html += `<div class="move-pair"><span class="move-num">…</span>`;
+        html += `<div class="move-pair"><span class="move-num">${m.move_number}…</span>`;
       }
       html += `<button class="move-btn ${clsCls}" data-idx="${idx}" ${dataSym}
         onclick="goToMove(${idx + 1})">${escHtml(m.san)}</button>
@@ -652,19 +896,25 @@ function goToMove(idx) {
 
   renderBoard(fen, boardOrientation, hl);
 
-  // Arrow: show the engine's suggestion for the move just played (moves[target-1])
-  // alongside a gray arrow for what was actually played — both at the same time.
-  let bmUci      = null;
-  let actualMove = null;
+  // Draw move arrows: actual move played + engine suggestion (if any).
+  // classification is passed only for the player's own moves so the arrow colour
+  // matches the move-list button (red=blunder, orange=mistake, yellow=inaccuracy,
+  // blue=best, grey=opponent/unknown).
+  let bmUci          = null;
+  let actualMove     = null;
+  let classification = null;
   if (target > 0 && moves[target - 1]) {
     const m = moves[target - 1];
     bmUci = m.best_move_uci || null;
-    // Show gray actual-move arrow only when the played move differs from the suggestion
-    if (bmUci && m.classification !== 'best' && m.fen_before && m.fen) {
+    if (m.fen_before && m.fen) {
       actualMove = computeActualMove(m.fen_before, m.fen);
     }
+    // Only apply classification colour for the player's own moves
+    if (currentGame && m.color === currentGame.played_as) {
+      classification = m.classification || null;
+    }
   }
-  drawMoveArrows(bmUci, actualMove, boardOrientation);
+  drawMoveArrows(bmUci, actualMove, boardOrientation, classification);
 
   updateMoveHighlight(target - 1);
   updateMoveCounter();
@@ -717,91 +967,111 @@ function scrollMoveIntoView(idx) {
 
 async function reAnalyzeGame() {
   if (!currentGame) return;
+  if (currentGame.moves && !confirm('Re-analyze this game from scratch? This re-runs Stockfish and Claude.')) return;
   const btn = document.getElementById('btn-reanalyze');
   btn.disabled = true;
   btn.textContent = '…';
 
-  await fetch(`/api/game/${currentGame.id}/analyze`, { method: 'POST' });
-
-  document.getElementById('analyzing-banner').style.display = 'block';
-  document.getElementById('game-view').style.display        = 'none';
-  stopPolling();
-  pollTimer = setInterval(() => checkAnalysisStatus(currentGame.id), 4000);
-
-  btn.disabled    = false;
-  btn.textContent = '↺ Re-analyze';
+  try {
+    await fetch(`/api/game/${currentGame.id}/analyze`, { method: 'POST' });
+    document.getElementById('analyzing-banner').style.display = 'flex';
+    document.getElementById('game-view').style.display        = 'none';
+    document.getElementById('analysis-error').style.display   = 'none';
+    stopPolling();
+    pollTimer = setInterval(() => checkAnalysisStatus(currentGame.id), 4000);
+  } catch (e) {
+    toast('Re-analysis failed: ' + e.message);
+  } finally {
+    btn.disabled    = false;
+    btn.textContent = '↺ Re-analyze';
+  }
 }
 
 async function analyzeGameFromList(event, gameId) {
   event.stopPropagation();
   const btn = event.currentTarget;
+  // Re-analyzing an already analyzed game wipes it and re-runs the whole
+  // (slow, paid) pipeline — make sure it wasn't a stray tap.
+  const isReanalysis = btn.dataset.analyzed === '1';
+  if (isReanalysis && !confirm('Re-analyze this game from scratch? This re-runs Stockfish and Claude.')) return;
   btn.disabled = true;
   btn.textContent = '…';
 
-  await fetch(`/api/game/${gameId}/analyze`, { method: 'POST' });
-  toast('Analyzing this game…');
-  if (isMobileLayout()) setMobileGamesVisible(false);
-  await loadGame(gameId);
-
-  btn.disabled = false;
+  try {
+    await fetch(`/api/game/${gameId}/analyze`, { method: 'POST' });
+    toast('Analyzing this game…');
+    await loadGame(gameId);
+  } catch (e) {
+    toast('Could not start analysis: ' + e.message);
+    btn.disabled = false;
+  }
 }
 
 async function reAnalyzeAll() {
   const btn = document.getElementById('btn-reanalyze-all');
   btn.disabled = true;
 
-  // Fetch the full game list
-  const res   = await fetch('/api/games');
-  const games = await res.json();
-  if (!games.length) {
-    toast('No games to re-analyze. Fetch games first.');
+  try {
+    // Fetch the full game list
+    const res   = await fetch('/api/games');
+    const games = await res.json();
+    const analyzed = games.filter(g => g.analyzed);
+    if (!analyzed.length) {
+      toast(games.length ? 'No analyzed games yet.' : 'No games to re-analyze. Fetch games first.');
+      return;
+    }
+
+    if (!confirm(`Re-analyze all ${analyzed.length} games from scratch? This re-runs Stockfish and Claude on every game and takes a while.`)) return;
+
+    toast(`Queuing ${analyzed.length} games for re-analysis…`);
+
+    // Fire-and-forget each game — the server processes them in background threads
+    for (const g of analyzed) {
+      await fetch(`/api/game/${g.id}/analyze`, { method: 'POST' });
+    }
+
+    toast(`${analyzed.length} games queued. Analysis runs in the background.`);
+    loadGameList();
+  } catch (e) {
+    toast('Re-analyze all failed: ' + e.message);
+  } finally {
     btn.disabled = false;
-    return;
   }
-
-  const analyzed = games.filter(g => g.analyzed);
-  if (!analyzed.length) {
-    toast('No analyzed games yet.');
-    btn.disabled = false;
-    return;
-  }
-
-  toast(`Queuing ${analyzed.length} games for re-analysis…`);
-  btn.textContent = `↺ Queuing…`;
-
-  // Fire-and-forget each game — the server processes them in background threads
-  for (const g of analyzed) {
-    await fetch(`/api/game/${g.id}/analyze`, { method: 'POST' });
-  }
-
-  toast(`${analyzed.length} games queued. Analysis runs in the background.`);
-  btn.textContent = '↺ Re-analyze All';
-  btn.disabled    = false;
-  loadGameList();
 }
 
 async function redoCommentary() {
   if (!currentGame) return;
   const btn = document.getElementById('btn-redo-commentary');
   btn.disabled = true;
-  btn.textContent = '…';
-  await fetch(`/api/game/${currentGame.id}/redo-commentary`, { method: 'POST' });
-  document.getElementById('commentary-banner').style.display = 'block';
-  stopPolling();
-  pollTimer = setInterval(() => checkAnalysisStatus(currentGame.id), 4000);
-  btn.disabled = false;
-  btn.textContent = '↻ Refresh Commentary';
+  try {
+    await fetch(`/api/game/${currentGame.id}/redo-commentary`, { method: 'POST' });
+    document.getElementById('commentary-banner').style.display = 'flex';
+    document.getElementById('analysis-error').style.display    = 'none';
+    stopPolling();
+    // Commentary keeps the Stockfish data — poll the commentary flag, not the
+    // analyzed flag (which is already 1 and would fire instantly).
+    pollTimer = setInterval(() => checkCommentaryStatus(currentGame.id), 5000);
+  } catch (e) {
+    toast('Could not restart commentary: ' + e.message);
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 async function refreshAllCommentary() {
   const btn = document.getElementById('btn-refresh-commentary');
+  if (!confirm('Re-run Claude commentary on every analyzed game?')) return;
   btn.disabled = true;
-  btn.textContent = '↻ Queuing…';
-  const res  = await fetch('/api/commentary/refresh-all', { method: 'POST' });
-  const data = await res.json();
-  toast(`Refreshing commentary for ${data.count} games in the background.`);
-  btn.textContent = '↻ Refresh Commentary';
-  btn.disabled = false;
+  try {
+    const res  = await fetch('/api/commentary/refresh-all', { method: 'POST' });
+    const data = await res.json();
+    if (data.error) { toast(data.error); return; }
+    toast(`Refreshing commentary for ${data.count} games in the background.`);
+  } catch (e) {
+    toast('Refresh failed: ' + e.message);
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -839,11 +1109,11 @@ function drawEvalGraph(moves, playedAs, currentIdx) {
   function evalToY(e) { return midY - (e / MAX) * (midY - 3); }
 
   // Background
-  ctx.fillStyle = '#0f0f1a';
+  ctx.fillStyle = '#0e1120';
   ctx.fillRect(0, 0, w, h);
 
   // Center line
-  ctx.strokeStyle = '#2a2a4a';
+  ctx.strokeStyle = '#262b4a';
   ctx.lineWidth   = 1;
   ctx.beginPath();
   ctx.moveTo(0, midY);
@@ -863,23 +1133,29 @@ function drawEvalGraph(moves, playedAs, currentIdx) {
     ctx.closePath();
   }
 
-  // Green fill: winning region (clip to above midY)
+  // Green fill: winning region (clip to above midY), fading toward the center line
   ctx.save();
   ctx.beginPath();
   ctx.rect(0, 0, w, midY);
   ctx.clip();
   buildPath();
-  ctx.fillStyle = 'rgba(34,197,94,0.28)';
+  const gGrad = ctx.createLinearGradient(0, 0, 0, midY);
+  gGrad.addColorStop(0, 'rgba(34,197,94,0.42)');
+  gGrad.addColorStop(1, 'rgba(34,197,94,0.10)');
+  ctx.fillStyle = gGrad;
   ctx.fill();
   ctx.restore();
 
-  // Red fill: losing region (clip to below midY)
+  // Red fill: losing region (clip to below midY), fading away from the center line
   ctx.save();
   ctx.beginPath();
   ctx.rect(0, midY, w, midY);
   ctx.clip();
   buildPath();
-  ctx.fillStyle = 'rgba(239,68,68,0.28)';
+  const rGrad = ctx.createLinearGradient(0, midY, 0, h);
+  rGrad.addColorStop(0, 'rgba(239,68,68,0.10)');
+  rGrad.addColorStop(1, 'rgba(239,68,68,0.42)');
+  ctx.fillStyle = rGrad;
   ctx.fill();
   ctx.restore();
 
@@ -887,8 +1163,8 @@ function drawEvalGraph(moves, playedAs, currentIdx) {
   ctx.beginPath();
   ctx.moveTo(0.5 * xStep, evalToY(evals[0]));
   for (let i = 1; i < n; i++) ctx.lineTo((i + 0.5) * xStep, evalToY(evals[i]));
-  ctx.strokeStyle = 'rgba(255,255,255,0.4)';
-  ctx.lineWidth   = 1;
+  ctx.strokeStyle = 'rgba(230,234,244,0.45)';
+  ctx.lineWidth   = 1.25;
   ctx.stroke();
 
   // Blunder / mistake dots
@@ -907,12 +1183,17 @@ function drawEvalGraph(moves, playedAs, currentIdx) {
   // Cursor line (current move)
   if (currentIdx > 0 && currentIdx <= n) {
     const cx = (currentIdx - 0.5) * xStep;
-    ctx.strokeStyle = '#7c3aed';
+    ctx.strokeStyle = '#8b5cf6';
     ctx.lineWidth   = 2;
     ctx.beginPath();
     ctx.moveTo(cx, 0);
     ctx.lineTo(cx, h);
     ctx.stroke();
+    // Dot marking the eval at the current move
+    ctx.beginPath();
+    ctx.arc(cx, evalToY(evals[currentIdx - 1]), 3, 0, Math.PI * 2);
+    ctx.fillStyle = '#c4b5fd';
+    ctx.fill();
   }
 }
 
@@ -929,6 +1210,20 @@ function findCriticalMoment(moves, playedAs) {
     if (d > maxDelta) { maxDelta = d; critIdx = i; }
   });
   return critIdx;
+}
+
+// Jump to the player's previous/next inaccuracy, mistake, or blunder.
+function jumpToMistake(dir) {
+  if (!currentGame || !currentGame.moves) return;
+  const moves = currentGame.moves;
+  const isErr = m => m.color === currentGame.played_as &&
+    ['inaccuracy', 'mistake', 'blunder'].includes(m.classification);
+  let i = currentMoveIdx - 1 + dir;
+  while (i >= 0 && i < moves.length) {
+    if (isErr(moves[i])) { goToMove(i + 1); return; }
+    i += dir;
+  }
+  toast(dir > 0 ? 'No mistakes after this move' : 'No mistakes before this move');
 }
 
 function markCriticalMoment(idx) {
@@ -973,7 +1268,7 @@ function showExplanation(move, playedAs) {
       commentEl.textContent = '⏳ Commentary loading…';
       commentEl.classList.add('muted');
     } else if (!isMyMove) {
-      commentEl.textContent = `Navigate with ← → to see commentary on this move.`;
+      commentEl.textContent = `Opponent's move — coaching notes appear on your own moves.`;
       commentEl.classList.add('muted');
     } else {
       const deltaP = move.delta ? (Math.abs(move.delta) / 100).toFixed(1) : null;
@@ -1016,6 +1311,88 @@ function clearExplanation() {
   c.style.opacity = '1';
   document.getElementById('analysis-best-move').style.display = 'none';
   document.getElementById('analysis-eval').textContent        = '';
+  renderGameOverview(currentGame);
+}
+
+// ---------------------------------------------------------------------------
+// Game Overview section
+// ---------------------------------------------------------------------------
+
+let gameOverviewCollapsed = false;
+
+function toggleGameOverview() {
+  gameOverviewCollapsed = !gameOverviewCollapsed;
+  document.getElementById('game-overview-section').classList.toggle('collapsed', gameOverviewCollapsed);
+}
+
+// Per-game accuracy from the Stockfish data already stored on each move,
+// using the lichess method: convert evals to win-percentage, score each move
+// by how much win-chance it gave up, then average. Working in win% (not raw
+// centipawns) keeps mate-score swings (±2000cp+) from flattening the result.
+function winPercent(cp) {
+  return 50 + 50 * (2 / (1 + Math.exp(-0.00368208 * cp)) - 1);
+}
+
+function computeGameStats(moves, playedAs) {
+  const mine = (moves || []).filter(m => m.color === playedAs);
+  let counts = { blunder: 0, mistake: 0, inaccuracy: 0 };
+  let totalLoss = 0, accSum = 0, evaluated = 0;
+  mine.forEach(m => {
+    if (counts[m.classification] !== undefined) counts[m.classification]++;
+    if (m.eval_before === null || m.eval_before === undefined ||
+        m.eval_after  === null || m.eval_after  === undefined) return;
+    // ACPL: cap each move's loss at 1000cp so mate scores don't distort it
+    totalLoss += Math.min(1000, Math.max(0, m.delta ?? 0));
+    const winDrop = Math.max(0, winPercent(m.eval_before) - winPercent(m.eval_after));
+    accSum += Math.max(0, Math.min(100, 103.1668 * Math.exp(-0.04354 * winDrop) - 3.1669));
+    evaluated++;
+  });
+  if (!evaluated) return null;
+  return {
+    acpl: Math.round(totalLoss / evaluated),
+    accuracy: Math.round(accSum / evaluated),
+    ...counts,
+  };
+}
+
+function renderGameStats(game) {
+  const el = document.getElementById('game-stats-row');
+  if (!el) return;
+  const stats = game && game.moves ? computeGameStats(game.moves, game.played_as) : null;
+  if (!stats) {
+    el.style.display = 'none';
+    return;
+  }
+  el.style.display = '';
+  el.innerHTML = `
+    <span class="stat-chip stat-accuracy" title="Estimated accuracy from average centipawn loss">Accuracy ${stats.accuracy}%</span>
+    <span class="stat-chip" title="Average centipawn loss per move">Avg loss ${stats.acpl}cp</span>
+    <span class="stat-chip stat-blunder" title="Blunders">${stats.blunder} ??</span>
+    <span class="stat-chip stat-mistake" title="Mistakes">${stats.mistake} ?</span>
+    <span class="stat-chip stat-inaccuracy" title="Inaccuracies">${stats.inaccuracy} ?!</span>`;
+}
+
+function renderGameOverview(game) {
+  const section = document.getElementById('game-overview-section');
+  const textEl  = document.getElementById('game-overview-text');
+
+  if (!game || !game.moves) {
+    section.style.display = 'none';
+    return;
+  }
+
+  section.style.display = '';
+  renderGameStats(game);
+  if (game.game_summary) {
+    textEl.textContent = game.game_summary;
+    textEl.classList.remove('muted');
+  } else if (game.commentary_pending) {
+    textEl.textContent = '⏳ Generating overview…';
+    textEl.classList.add('muted');
+  } else {
+    textEl.textContent = 'No overview available for this game.';
+    textEl.classList.add('muted');
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1070,8 +1447,11 @@ function renderPatterns(report, generated_at) {
     document.getElementById('coach-title').textContent = `♟ Coach · ${date}`;
   }
 
+  // Prepend a "cross-game analysis" label so it's clear this isn't about the current game
+  const disclaimer = '<div class="coach-scope-note">Analysis across all your analyzed games — not the current game</div>';
+
   // Render bullet points and bold text from the Claude report
-  const html = report
+  const html = disclaimer + report
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
     .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
     .split(/\n+/)
@@ -1329,6 +1709,52 @@ document.addEventListener('DOMContentLoaded', () => {
       document.body.style.userSelect = '';
     });
   }
+
+  // ── Column resize handles (left / right sidebars) ──────────
+  function makeColResizer(handleId, panelId, side, minW, maxW, storageKey) {
+    const rHandle = document.getElementById(handleId);
+    const panel   = document.getElementById(panelId);
+    if (!rHandle || !panel) return;
+
+    // Restore saved width
+    const saved = localStorage.getItem(storageKey);
+    if (saved) panel.style.width = saved + 'px';
+
+    let colDragging = false;
+    let colStartX   = 0;
+    let colStartW   = 0;
+
+    rHandle.addEventListener('mousedown', e => {
+      colDragging = true;
+      colStartX   = e.clientX;
+      colStartW   = panel.getBoundingClientRect().width;
+      rHandle.classList.add('dragging');
+      document.body.style.cursor     = 'col-resize';
+      document.body.style.userSelect = 'none';
+      e.preventDefault();
+    });
+
+    document.addEventListener('mousemove', e => {
+      if (!colDragging) return;
+      const delta = side === 'left'
+        ? e.clientX - colStartX    // drag right → panel grows
+        : colStartX - e.clientX;   // drag left  → panel grows
+      const newW = Math.max(minW, Math.min(maxW, colStartW + delta));
+      panel.style.width = newW + 'px';
+    });
+
+    document.addEventListener('mouseup', () => {
+      if (!colDragging) return;
+      colDragging = false;
+      rHandle.classList.remove('dragging');
+      document.body.style.cursor     = '';
+      document.body.style.userSelect = '';
+      localStorage.setItem(storageKey, parseInt(panel.style.width));
+    });
+  }
+
+  makeColResizer('resize-handle-left',  'game-list-panel', 'left',  160, 480, 'chess-left-w');
+  makeColResizer('resize-handle-right', 'analysis-panel',  'right', 300, 700, 'chess-right-w');
 });
 
 // ---------------------------------------------------------------------------

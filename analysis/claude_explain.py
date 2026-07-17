@@ -71,6 +71,15 @@ def needs_claude_commentary(moves, played_as):
     return any(_needs_claude(m, played_as) for m in moves or [])
 
 
+def commentary_incomplete(moves, played_as):
+    """Return True when moves that need a Claude note still carry the pending
+    placeholder text — i.e. explain_game() didn't (fully) succeed."""
+    return any(
+        _needs_claude(m, played_as) and _PENDING_DETAIL_TEXT in (m.get('explanation') or '')
+        for m in moves or []
+    )
+
+
 def finalize_fast_comments(moves, played_as):
     """Remove temporary pending language once commentary generation is finished."""
     for m in moves or []:
@@ -80,6 +89,107 @@ def finalize_fast_comments(moves, played_as):
         ):
             m['explanation'] = _quick_mistake_comment(m, pending=False)
     return moves
+
+
+GAME_SUMMARY_SYSTEM = """\
+You are a personal chess coach writing a brief overall assessment of a complete game.
+
+Write 3–5 sentences covering:
+1. How the opening went (solid, equal, shaky, aggressive) and when the game first became unbalanced
+2. When the decisive turning point arrived and what caused it — name the phase (opening/middlegame/endgame)
+3. One overarching coaching takeaway the player should carry to their next game
+
+Use "you" language throughout. Be concrete but do NOT name piece squares unless they appear in the provided move data. Keep it under 90 words. Return ONLY the plain narrative text — no JSON, no headers, no bullet points.\
+"""
+
+
+def generate_game_summary(moves, played_as, config, game_result='unknown',
+                           player_profile=None, opening=None):
+    """Return a 3–5 sentence holistic game assessment, or None on failure."""
+    api_key = config.get('anthropic_api_key')
+    if not api_key or not moves:
+        return None
+
+    client = anthropic.Anthropic(api_key=api_key)
+
+    move_seq   = _build_move_sequence(moves)
+    milestones = _eval_milestones(moves, played_as)
+
+    blunders     = sum(1 for m in moves if m.get('color') == played_as and m.get('classification') == 'blunder')
+    mistakes     = sum(1 for m in moves if m.get('color') == played_as and m.get('classification') == 'mistake')
+    inaccuracies = sum(1 for m in moves if m.get('color') == played_as and m.get('classification') == 'inaccuracy')
+
+    profile_block = f"PLAYER PROFILE (recurring patterns from prior games):\n{player_profile}\n\n" if player_profile else ""
+    opening_line  = f"Opening: {opening}\n" if opening else ""
+
+    user_prompt = (
+        f"{profile_block}"
+        f"Game: I played as {played_as}. Result: {game_result}. {opening_line}"
+        f"Move count: {len(moves)}\n"
+        f"My errors: {blunders} blunder(s), {mistakes} mistake(s), {inaccuracies} inaccuracy(ies)\n\n"
+        f"Full move sequence:\n{move_seq}\n\n"
+        f"Evaluation curve milestones (from {played_as}'s perspective; positive = I am better):\n"
+        f"{milestones}\n\n"
+        "Write a 3–5 sentence holistic game assessment for this player."
+    )
+
+    model = config.get('explain_model', 'claude-sonnet-4-6')
+    kwargs = {
+        'model': model,
+        'max_tokens': 400,
+        'system': GAME_SUMMARY_SYSTEM,
+        'messages': [{'role': 'user', 'content': user_prompt}],
+        'timeout': config.get('explain_timeout', 180),
+    }
+    if 'opus' in model:
+        kwargs['thinking']      = {'type': 'adaptive'}
+        kwargs['output_config'] = {'effort': 'high'}
+        kwargs['max_tokens']    = 800
+
+    try:
+        response = client.messages.create(**kwargs)
+        text = next((b.text for b in response.content if getattr(b, 'type', None) == 'text'), '').strip()
+        return text or None
+    except Exception as e:
+        print(f"Game summary generation failed: {e}")
+        return None
+
+
+def _eval_milestones(moves, played_as):
+    """Compact eval-curve description: phase boundaries + big swings."""
+    lines = []
+
+    # eval_before/eval_after are stored from the MOVER's perspective.
+    # Convert to the player's perspective: flip the sign on opponent moves.
+    def _fmt(cp, mover_color):
+        v = (cp if mover_color == played_as else -cp) / 100
+        return f"{'+' if v >= 0 else ''}{v:.1f}"
+
+    seen_phases = {}
+    for m in moves:
+        ph = _phase(m['move_number'])
+        if ph not in seen_phases:
+            ev = m.get('eval_before')
+            if ev is not None:
+                seen_phases[ph] = (m['move_number'], ev)
+                lines.append(f"  Start of {ph} (move {m['move_number']}): {_fmt(ev, m['color'])}")
+
+    last = moves[-1]
+    ev = last.get('eval_after')
+    if ev is not None:
+        lines.append(f"  Final (move {last['move_number']}): {_fmt(ev, last['color'])}")
+
+    for m in moves:
+        delta = abs(m.get('delta') or 0)
+        if delta >= 150 and m.get('eval_before') is not None and m.get('eval_after') is not None:
+            whose = 'my' if m['color'] == played_as else "opponent's"
+            lines.append(
+                f"  Move {m['move_number']} ({whose} {m['san']}): "
+                f"{_fmt(m['eval_before'], m['color'])} → {_fmt(m['eval_after'], m['color'])} "
+                f"[{m.get('classification', '?')}]"
+            )
+
+    return '\n'.join(lines) if lines else '  (no eval data available)'
 
 
 def explain_game(moves, played_as, config, game_result='unknown', player_profile=None):

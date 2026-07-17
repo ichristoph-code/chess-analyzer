@@ -5,14 +5,17 @@ import os
 import sqlite3
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 from flask import Flask, jsonify, render_template, request, send_from_directory
 
 from analysis.blueprint import generate_blueprint
 from analysis.claude_explain import (
+    commentary_incomplete,
     explain_game,
     fill_fast_comments,
     finalize_fast_comments,
+    generate_game_summary,
     needs_claude_commentary,
 )
 from analysis.engine import annotate_game, get_best_move
@@ -85,7 +88,7 @@ def _no_cache_for_api(response):
 # ---------------------------------------------------------------------------
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     c = conn.cursor()
     c.execute("""
         CREATE TABLE IF NOT EXISTS games (
@@ -122,6 +125,7 @@ def init_db():
         "ALTER TABLE games ADD COLUMN eco TEXT",
         "ALTER TABLE games ADD COLUMN opening TEXT",
         "ALTER TABLE analysis ADD COLUMN claude_ok INTEGER DEFAULT 1",
+        "ALTER TABLE analysis ADD COLUMN game_summary TEXT",
     ]:
         try:
             c.execute(alter)
@@ -132,7 +136,7 @@ def init_db():
 
 
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")   # safe for concurrent readers + writer
     return conn
@@ -143,7 +147,13 @@ def get_db():
 
 @app.route('/')
 def index():
-    return render_template('index.html', username=CONFIG.get('chesscom_username', ''))
+    js_path = os.path.join(os.path.dirname(__file__), 'static', 'js', 'app.js')
+    try:
+        mtime = str(int(os.path.getmtime(js_path)))
+    except OSError:
+        mtime = '1'
+    return render_template('index.html', username=CONFIG.get('chesscom_username', ''),
+                           static_version=mtime)
 
 
 @app.route('/manifest.json')
@@ -238,7 +248,7 @@ def get_game(game_id):
     try:
         game     = conn.execute('SELECT * FROM games WHERE id = ?', (game_id,)).fetchone()
         analysis = conn.execute(
-            'SELECT moves_json, claude_ok FROM analysis WHERE game_id = ?', (game_id,)
+            'SELECT moves_json, claude_ok, game_summary FROM analysis WHERE game_id = ?', (game_id,)
         ).fetchone() if game else None
     finally:
         conn.close()
@@ -255,16 +265,24 @@ def get_game(game_id):
 
         if moves is not None:
             claude_ok = bool(analysis['claude_ok']) if analysis['claude_ok'] is not None else True
-            result['moves']    = moves
-            result['analyzing'] = False
-            result['claude_ok'] = claude_ok
+            result['moves']        = moves
+            result['analyzing']    = False
+            result['claude_ok']    = claude_ok
+            result['game_summary'] = analysis['game_summary'] or None
 
             if not claude_ok:
                 moves = fill_fast_comments(moves, result.get('played_as'))
                 result['moves'] = moves
-                if game_id not in _analysis_in_progress:
+                # Only auto-retry commentary a few times — without this cap, a
+                # broken API key would trigger a fresh paid Claude call on every
+                # 5-second status poll, forever.
+                with _analysis_lock:
+                    pending = game_id in _analysis_in_progress
+                    can_retry = _commentary_failures.get(game_id, 0) < MAX_COMMENTARY_RETRIES
+                if not pending and can_retry:
                     _maybe_start_commentary(game_id, dict(game), moves)
-                result['commentary_pending'] = True
+                    pending = True
+                result['commentary_pending'] = pending
             else:
                 moves = finalize_fast_comments(moves, result.get('played_as'))
                 result['moves'] = moves
@@ -312,6 +330,8 @@ def redo_commentary(game_id):
     finally:
         conn.close()
 
+    with _analysis_lock:
+        _commentary_failures.pop(game_id, None)   # explicit redo resets the retry budget
     _maybe_start_commentary(game_id, dict(game), moves)
     return jsonify({'status': 'commentary_queued'})
 
@@ -422,7 +442,12 @@ def chat():
         "Answer questions about the current position clearly and concisely in plain English. "
         "No long move sequences. "
         "CRITICAL: You cannot calculate chess moves reliably. Never suggest a move from your own reasoning. "
-        "If the user asks what to play, always use the Stockfish recommendation provided in the context."
+        "If the user asks what to play, always use the Stockfish recommendation provided in the context.\n\n"
+        "CRITICAL: The context below contains an 'Exact piece locations' section that was machine-parsed "
+        "directly from the FEN by python-chess — it is 100% accurate. You MUST use it as ground truth "
+        "for all piece and pawn locations. Do NOT attempt to re-parse the FEN yourself. "
+        "If a piece or pawn is not listed there, it does not exist on the board. "
+        "Never assert a piece is on a square unless it appears in that list."
         + (f"\n\nCurrent position context:\n{context}" if context else "")
         + stockfish_note
     )
@@ -474,6 +499,13 @@ def _build_chat_context(game_id, move_idx):
         lines.append(f"\nCurrent move: {m['move_number']}. {m['san']} (played by {m['color']})")
         lines.append(f"Position FEN: {m['fen']}")
 
+        # Add machine-parsed board state so Claude doesn't have to parse FEN mentally
+        fen_for_board = m.get('fen_before') or m.get('fen')
+        board_lines = _fen_board_state(fen_for_board)
+        if board_lines:
+            lines.append("Exact piece locations after this move (machine-parsed, 100% accurate — do NOT contradict this):")
+            lines.extend(board_lines)
+
         # Eval context
         e_before = m.get('eval_before')
         e_after  = m.get('eval_after')
@@ -506,6 +538,36 @@ def _build_chat_context(game_id, move_idx):
         return '\n'.join(lines)
     except Exception:
         return ''
+
+
+def _fen_board_state(fen: str) -> list:
+    """Return plain-English lines listing every piece by square, parsed by python-chess.
+
+    This is authoritative — Claude must not contradict it by trying to re-parse the FEN.
+    """
+    if not fen:
+        return []
+    try:
+        import chess as _chess
+        board = _chess.Board(fen)
+        _NAMES = {
+            _chess.KING: 'King', _chess.QUEEN: 'Queen', _chess.ROOK: 'Rook',
+            _chess.BISHOP: 'Bishop', _chess.KNIGHT: 'Knight', _chess.PAWN: 'Pawn',
+        }
+        order = [_chess.KING, _chess.QUEEN, _chess.ROOK, _chess.BISHOP, _chess.KNIGHT, _chess.PAWN]
+        lines = []
+        for color, label in ((_chess.WHITE, 'White'), (_chess.BLACK, 'Black')):
+            parts = []
+            for pt in order:
+                sqs = sorted(board.pieces(pt, color), key=lambda s: (_chess.square_file(s), _chess.square_rank(s)))
+                if sqs:
+                    name = _NAMES[pt] + ('s' if len(sqs) > 1 else '')
+                    parts.append(f"{name} {' '.join(_chess.square_name(s) for s in sqs)}")
+            if parts:
+                lines.append(f"  {label}: {', '.join(parts)}")
+        return lines
+    except Exception:
+        return []
 
 
 def _get_current_fen(game_id, move_idx):
@@ -541,7 +603,7 @@ def gen_patterns():
 
     def _run():
         report = generate_patterns(username, DB_PATH, CONFIG)
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH, timeout=30)
         conn.execute(
             'INSERT OR REPLACE INTO patterns (username, report, generated_at) VALUES (?,?,?)',
             (username, report, int(time.time())),
@@ -559,13 +621,28 @@ def gen_patterns():
 _analysis_in_progress = set()
 _analysis_lock = threading.Lock()
 
+# game_id → consecutive commentary failures. Guarded by _analysis_lock.
+# Once a game hits MAX_COMMENTARY_RETRIES, we stop auto-retrying on status
+# polls; an explicit "redo commentary" resets the counter.
+_commentary_failures = {}
+MAX_COMMENTARY_RETRIES = 2
+
+# Bounded pools: "Re-analyze All" used to spawn one thread per game, i.e. dozens
+# of concurrent Stockfish processes (CPU thrash) or Claude calls (rate limits).
+# A few jobs at a time finishes faster overall and stays stable.
+_stockfish_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix='stockfish')
+_claude_pool    = ThreadPoolExecutor(max_workers=3, thread_name_prefix='claude')
+
 
 def _maybe_start_analysis(game_id, game, force=False):
+    # Even on force, never start a second concurrent run for the same game —
+    # two threads would race on the analysis row. The in-flight run still
+    # writes a fresh result, which is what force wants anyway.
     with _analysis_lock:
-        if game_id in _analysis_in_progress and not force:
+        if game_id in _analysis_in_progress:
             return
         _analysis_in_progress.add(game_id)
-    threading.Thread(target=_run_analysis, args=(game_id, game), daemon=True).start()
+    _stockfish_pool.submit(_run_analysis, game_id, game)
 
 
 def _maybe_start_commentary(game_id, game, moves):
@@ -574,7 +651,7 @@ def _maybe_start_commentary(game_id, game, moves):
         if game_id in _analysis_in_progress:
             return
         _analysis_in_progress.add(game_id)
-    threading.Thread(target=_run_commentary, args=(game_id, game, moves), daemon=True).start()
+    _claude_pool.submit(_run_commentary, game_id, game, moves)
 
 
 def _run_commentary(game_id, game, moves):
@@ -584,24 +661,42 @@ def _run_commentary(game_id, game, moves):
         played_as = game['played_as']
         username  = game.get('username', CONFIG.get('chesscom_username', ''))
         moves = fill_fast_comments(moves, played_as)
+        player_profile = get_player_weakness_summary(username, DB_PATH)
         if needs_claude_commentary(moves, played_as):
-            player_profile = get_player_weakness_summary(username, DB_PATH)
             moves = explain_game(
                 moves, played_as, CONFIG,
                 game_result=game.get('result', 'unknown'),
                 player_profile=player_profile,
             )
-        moves = finalize_fast_comments(moves, played_as)
-        claude_ok = True
+        # explain_game swallows API errors — detect failure by leftover
+        # pending placeholders so claude_ok reflects reality.
+        claude_ok = not commentary_incomplete(moves, played_as)
+        game_summary = None
+        if claude_ok:
+            moves = finalize_fast_comments(moves, played_as)
+            game_summary = generate_game_summary(
+                moves, played_as, CONFIG,
+                game_result=game.get('result', 'unknown'),
+                player_profile=player_profile,
+                opening=game.get('opening'),
+            )
 
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH, timeout=30)
         conn.execute(
-            'UPDATE analysis SET moves_json=?, claude_ok=? WHERE game_id=?',
-            (json.dumps(moves), int(claude_ok), game_id),
+            'UPDATE analysis SET moves_json=?, claude_ok=?, '
+            'game_summary=COALESCE(?, game_summary) WHERE game_id=?',
+            (json.dumps(moves), int(claude_ok), game_summary, game_id),
         )
         conn.commit()
+        with _analysis_lock:
+            if claude_ok:
+                _commentary_failures.pop(game_id, None)
+            else:
+                _commentary_failures[game_id] = _commentary_failures.get(game_id, 0) + 1
         print(f"Commentary complete for {game_id}: claude_ok={claude_ok}")
     except Exception as e:
+        with _analysis_lock:
+            _commentary_failures[game_id] = _commentary_failures.get(game_id, 0) + 1
         print(f"Commentary failed for {game_id}: {e}")
     finally:
         if conn:
@@ -622,7 +717,7 @@ def _run_analysis(game_id, game):
         moves = fill_fast_comments(moves, played_as)
         needs_commentary = needs_claude_commentary(moves, played_as)
 
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH, timeout=30)
         conn.execute(
             'INSERT OR REPLACE INTO analysis (game_id, moves_json, claude_ok) VALUES (?,?,?)',
             (game_id, json.dumps(moves), int(not needs_commentary)),
@@ -632,21 +727,36 @@ def _run_analysis(game_id, game):
         conn.close()
         conn = None
 
-        # Phase 2: Claude commentary.
+        # Phase 2: Claude commentary + game summary.
+        username = game.get('username', CONFIG.get('chesscom_username', ''))
+        player_profile = get_player_weakness_summary(username, DB_PATH)
         if needs_commentary:
-            username = game.get('username', CONFIG.get('chesscom_username', ''))
-            player_profile = get_player_weakness_summary(username, DB_PATH)
             moves = explain_game(
                 moves, played_as, CONFIG,
                 game_result=game.get('result', 'unknown'),
                 player_profile=player_profile,
             )
-        moves = finalize_fast_comments(moves, played_as)
+        # explain_game swallows API errors — detect failure by leftover pending
+        # placeholders. On failure keep claude_ok=0 so the status-poll retry
+        # path (capped by MAX_COMMENTARY_RETRIES) can pick it up.
+        claude_ok = not commentary_incomplete(moves, played_as)
+        game_summary = None
+        if claude_ok:
+            moves = finalize_fast_comments(moves, played_as)
+            game_summary = generate_game_summary(
+                moves, played_as, CONFIG,
+                game_result=game.get('result', 'unknown'),
+                player_profile=player_profile,
+                opening=game.get('opening'),
+            )
+        else:
+            with _analysis_lock:
+                _commentary_failures[game_id] = _commentary_failures.get(game_id, 0) + 1
 
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH, timeout=30)
         conn.execute(
-            'UPDATE analysis SET moves_json=?, claude_ok=? WHERE game_id=?',
-            (json.dumps(moves), 1, game_id),
+            'UPDATE analysis SET moves_json=?, claude_ok=?, game_summary=? WHERE game_id=?',
+            (json.dumps(moves), int(claude_ok), game_summary, game_id),
         )
 
         # Auto-regenerate patterns every 5 newly analyzed games
@@ -674,7 +784,7 @@ def _auto_gen_patterns(username):
     """Background pattern regeneration triggered automatically every 5 analyzed games."""
     try:
         report = generate_patterns(username, DB_PATH, CONFIG)
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH, timeout=30)
         conn.execute(
             'INSERT OR REPLACE INTO patterns (username, report, generated_at) VALUES (?,?,?)',
             (username, report, int(time.time())),
@@ -691,12 +801,15 @@ def _auto_gen_patterns(username):
 
 if __name__ == '__main__':
     init_db()
-    port = CONFIG.get('port', 5050)
+    # PORT env var takes precedence (used by Claude Code preview proxy); fall back to config.json
+    port = int(os.environ.get('PORT', CONFIG.get('port', 5050)))
     # Auto-reload on Python file changes; use_reloader spawns a watcher process.
     # Set CHESS_NO_RELOAD=1 to disable (e.g. when launched headless).
+    # debug stays False: the server listens on 0.0.0.0, and the Werkzeug
+    # debugger would let anyone on the network execute code.
     use_reloader = os.environ.get('CHESS_NO_RELOAD') != '1'
     print(f"Chess Analyzer → http://localhost:{port} (auto-reload {'on' if use_reloader else 'off'})")
     app.run(
         host='0.0.0.0', port=port, threaded=True,
-        debug=use_reloader, use_reloader=use_reloader,
+        debug=False, use_reloader=use_reloader,
     )

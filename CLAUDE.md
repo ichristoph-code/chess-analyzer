@@ -31,7 +31,7 @@ python3 app.py
 **Three-layer pipeline:**
 
 - **`sources/chesscom.py`** — Fetches game history from `api.chess.com`. Caches to `.chesscom_cache.json` (1-hour TTL).
-- **`analysis/engine.py`** — Stockfish wrapper. Iterates positions with `python-chess`, evaluates each, classifies moves as best/inaccuracy/mistake/blunder using centipawn thresholds (200/500/900cp). Only classifies the player's own moves.
+- **`analysis/engine.py`** — Stockfish wrapper. Iterates positions with `python-chess`, evaluates each, classifies moves as best/inaccuracy/mistake/blunder using centipawn thresholds (100/300/600cp). Only classifies the player's own moves.
 - **`analysis/claude_explain.py`** — Calls `claude-sonnet-4-6` for plain-English explanations. Only called for mistakes/blunders. 150 token limit.
 - **`analysis/patterns.py`** — Aggregates blunder stats across all analyzed games; calls Claude for a coaching report.
 - **`app.py`** — Flask orchestrator. Routes, SQLite init, background analysis threads.
@@ -48,6 +48,7 @@ python3 app.py
 | `anthropic_api_key` | Anthropic API key |
 | `stockfish_path` | Path to Stockfish binary (default: `/opt/homebrew/bin/stockfish`) |
 | `stockfish_depth` | Analysis depth (default: 15) |
+| `stockfish_threads` | Engine threads per search (default: half the CPU cores minus one) |
 | `port` | Server port (default: 5050) |
 | `fetch_months` | How many months of history to fetch (default: 3) |
 
@@ -55,9 +56,9 @@ python3 app.py
 
 | Classification | Centipawn loss |
 |---|---|
-| Inaccuracy | > 200 cp |
-| Mistake | > 500 cp |
-| Blunder | > 900 cp |
+| Inaccuracy | ≥ 100 cp |
+| Mistake | ≥ 300 cp |
+| Blunder | ≥ 600 cp |
 
 ## Key Files
 
