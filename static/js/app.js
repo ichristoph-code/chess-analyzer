@@ -617,6 +617,7 @@ async function loadGame(gameId) {
   document.getElementById('placeholder').style.display      = 'none';
   document.getElementById('game-view').style.display        = 'none';
   document.getElementById('analyzing-banner').style.display = 'flex';
+  updateAnalyzingProgress(null);
   document.getElementById('move-list').innerHTML            = '';
   clearExplanation();
 
@@ -636,7 +637,7 @@ async function loadGame(gameId) {
 
   if (game.analyzing || !game.moves || !game.moves.length) {
     // Stockfish still running — keep full spinner, poll for completion
-    pollTimer = setInterval(() => checkAnalysisStatus(gameId), 4000);
+    pollTimer = setInterval(() => checkAnalysisStatus(gameId), 2000);
     return;
   }
 
@@ -654,7 +655,10 @@ async function checkAnalysisStatus(gameId) {
   try {
     const res  = await fetch(`/api/game/${gameId}/status`);
     const data = await res.json();
-    if (!data.analyzed) return;
+    if (!data.analyzed) {
+      updateAnalyzingProgress(data.progress);
+      return;
+    }
     stopPolling();
     playChime();
     loadGameList();
@@ -730,6 +734,24 @@ function playChime() {
 
 function stopPolling() {
   if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+}
+
+// Update the analyzing banner with live Stockfish progress from the server.
+// progress is {done, total} or null (e.g. queued behind another game).
+function updateAnalyzingProgress(progress) {
+  const text  = document.getElementById('analyzing-text');
+  const track = document.getElementById('analyzing-progress-track');
+  const fill  = document.getElementById('analyzing-progress-fill');
+  if (!text || !track || !fill) return;
+  if (progress && progress.total) {
+    text.textContent = `Analyzing with Stockfish… ${progress.done} / ${progress.total} positions`;
+    track.style.display = '';
+    fill.style.width = Math.round(progress.done / progress.total * 100) + '%';
+  } else {
+    text.textContent = 'Analyzing with Stockfish…';
+    track.style.display = 'none';
+    fill.style.width = '0%';
+  }
 }
 
 function renderGame(game) {
@@ -975,10 +997,11 @@ async function reAnalyzeGame() {
   try {
     await fetch(`/api/game/${currentGame.id}/analyze`, { method: 'POST' });
     document.getElementById('analyzing-banner').style.display = 'flex';
+    updateAnalyzingProgress(null);
     document.getElementById('game-view').style.display        = 'none';
     document.getElementById('analysis-error').style.display   = 'none';
     stopPolling();
-    pollTimer = setInterval(() => checkAnalysisStatus(currentGame.id), 4000);
+    pollTimer = setInterval(() => checkAnalysisStatus(currentGame.id), 2000);
   } catch (e) {
     toast('Re-analysis failed: ' + e.message);
   } finally {

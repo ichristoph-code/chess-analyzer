@@ -16,25 +16,30 @@ BLUNDER_THRESHOLD    = 600
 CRITICAL_SWING_THRESHOLD = 200
 
 
-def annotate_game(pgn_str, played_as, config):
+def annotate_game(pgn_str, played_as, config, progress_cb=None):
     """Parse a PGN string and return a list of annotated move dicts.
 
     Each dict contains:
         move_number, color, san, fen (after move), fen_before,
         eval_before, eval_after, delta, classification,
         best_move, best_move_uci, pv_line, candidates, explanation
+
+    progress_cb, if given, is called as progress_cb(done, total) while the
+    engine works so the UI can show live progress.
     """
     game = chess.pgn.read_game(io.StringIO(pgn_str))
     if game is None:
         return []
 
     stockfish_path = config.get('stockfish_path', '/opt/homebrew/bin/stockfish')
-    move_time = config.get('stockfish_move_time', 0.2)
+    # 0.1s/position with multiple threads reaches depth ~12-15 — plenty to
+    # spot 100/300/600cp swings. Critical positions get a deeper second pass.
+    move_time = config.get('stockfish_move_time', 0.1)
 
     try:
         with chess.engine.SimpleEngine.popen_uci(stockfish_path) as engine:
             _configure_engine(engine, config)
-            return _annotate_with_engine(game, engine, played_as, move_time)
+            return _annotate_with_engine(game, engine, played_as, move_time, progress_cb)
     except FileNotFoundError:
         print(f"Stockfish not found at {stockfish_path}. Install with: brew install stockfish")
         return _annotate_no_engine(game, played_as)
@@ -51,7 +56,7 @@ def _configure_engine(engine, config):
         print(f"Stockfish configure failed (using defaults): {e}")
 
 
-def _annotate_with_engine(game, engine, played_as, move_time):
+def _annotate_with_engine(game, engine, played_as, move_time, progress_cb=None):
     """Two-pass analysis:
       Pass 1 (fast): evaluate every position to find the centipawn swings.
       Pass 2 (selective): re-analyze critical positions with Multi-PV and longer time
@@ -63,19 +68,30 @@ def _annotate_with_engine(game, engine, played_as, move_time):
     if not nodes:
         return []
 
+    total_positions = len(nodes) + 1
+
+    def _report(done, total):
+        if progress_cb:
+            try:
+                progress_cb(done, total)
+            except Exception:
+                pass  # progress display must never break analysis
+
     # ── Pass 1: fast single-PV sweep ──
     fens = [board.fen()]
     info = engine.analyse(board, chess.engine.Limit(time=move_time))
     scores = [_to_cp(info['score'], chess.WHITE)]
     best_ucis = [info.get('pv', [None])[0]]
+    _report(1, total_positions)
 
     board_pass1 = board.copy()
-    for node in nodes:
+    for i, node in enumerate(nodes):
         board_pass1.push(node.move)
         info = engine.analyse(board_pass1, chess.engine.Limit(time=move_time))
         scores.append(_to_cp(info['score'], chess.WHITE))
         best_ucis.append(info.get('pv', [None])[0])
         fens.append(board_pass1.fen())
+        _report(i + 2, total_positions)
 
     # ── Identify critical positions (big swings on the player's moves) ──
     critical = set()
@@ -88,6 +104,9 @@ def _annotate_with_engine(game, engine, played_as, move_time):
             critical.add(i)  # re-analyse position BEFORE this move (fens[i])
 
     # ── Pass 2: deep Multi-PV for critical positions ──
+    # Progress total now grows by the number of critical positions.
+    total_with_deep = total_positions + len(critical)
+    deep_done = 0
     deep_data = {}   # index → {candidates, pv_line}
     critical_time = max(move_time * 4, 0.5)   # at least 0.5s, up to 4× base time
     for i in critical:
@@ -114,6 +133,9 @@ def _annotate_with_engine(game, engine, played_as, move_time):
             }
         except Exception as e:
             print(f"Deep analysis failed at move {i}: {e}")
+        finally:
+            deep_done += 1
+            _report(total_positions + deep_done, total_with_deep)
 
     # ── Build final move list ──
     board2 = board.copy()

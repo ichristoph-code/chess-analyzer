@@ -954,6 +954,25 @@ body {
   justify-content: center;
 }
 
+#analyzing-text { font-variant-numeric: tabular-nums; }
+
+#analyzing-progress-track {
+  width: min(280px, 70%);
+  height: 5px;
+  border-radius: 3px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+
+#analyzing-progress-fill {
+  height: 100%;
+  width: 0%;
+  border-radius: 3px;
+  background: linear-gradient(90deg, #8b5cf6, #6d28d9);
+  transition: width 0.4s ease;
+}
+
 /* ── Commentary-loading banner (inside game-view) ────────── */
 
 #commentary-banner {

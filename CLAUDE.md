@@ -47,7 +47,7 @@ python3 app.py
 | `chesscom_username` | Your chess.com username |
 | `anthropic_api_key` | Anthropic API key |
 | `stockfish_path` | Path to Stockfish binary (default: `/opt/homebrew/bin/stockfish`) |
-| `stockfish_depth` | Analysis depth (default: 15) |
+| `stockfish_move_time` | Seconds per position for the fast sweep (default: 0.1; critical positions get 4×, min 0.5s) |
 | `stockfish_threads` | Engine threads per search (default: half the CPU cores minus one) |
 | `port` | Server port (default: 5050) |
 | `fetch_months` | How many months of history to fetch (default: 3) |

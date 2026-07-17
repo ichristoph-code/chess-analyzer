@@ -370,7 +370,12 @@ def analysis_status(game_id):
         conn.close()
     if not row:
         return jsonify({'error': 'not found'}), 404
-    return jsonify({'analyzed': bool(row['analyzed'])})
+    with _analysis_lock:
+        prog = _analysis_progress.get(game_id)
+    return jsonify({
+        'analyzed': bool(row['analyzed']),
+        'progress': {'done': prog[0], 'total': prog[1]} if prog else None,
+    })
 
 # ---------------------------------------------------------------------------
 # Routes — Patterns API
@@ -627,6 +632,10 @@ _analysis_lock = threading.Lock()
 _commentary_failures = {}
 MAX_COMMENTARY_RETRIES = 2
 
+# game_id → (positions_done, positions_total) while Stockfish runs.
+# Guarded by _analysis_lock; read by the status endpoint for the progress UI.
+_analysis_progress = {}
+
 # Bounded pools: "Re-analyze All" used to spawn one thread per game, i.e. dozens
 # of concurrent Stockfish processes (CPU thrash) or Claude calls (rate limits).
 # A few jobs at a time finishes faster overall and stays stable.
@@ -713,7 +722,11 @@ def _run_analysis(game_id, game):
 
         # Phase 1: Stockfish annotation. Save immediately so the board is
         # viewable while Claude runs in the background.
-        moves = annotate_game(pgn, played_as, CONFIG)
+        def _progress(done, total):
+            with _analysis_lock:
+                _analysis_progress[game_id] = (done, total)
+
+        moves = annotate_game(pgn, played_as, CONFIG, progress_cb=_progress)
         moves = fill_fast_comments(moves, played_as)
         needs_commentary = needs_claude_commentary(moves, played_as)
 
@@ -778,6 +791,7 @@ def _run_analysis(game_id, game):
             conn.close()
         with _analysis_lock:
             _analysis_in_progress.discard(game_id)
+            _analysis_progress.pop(game_id, None)
 
 
 def _auto_gen_patterns(username):
