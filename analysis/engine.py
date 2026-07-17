@@ -1,6 +1,7 @@
 """Stockfish wrapper: annotates a PGN with centipawn evaluations and move classifications."""
 
 import io
+import os
 
 import chess
 import chess.engine
@@ -32,10 +33,22 @@ def annotate_game(pgn_str, played_as, config):
 
     try:
         with chess.engine.SimpleEngine.popen_uci(stockfish_path) as engine:
+            _configure_engine(engine, config)
             return _annotate_with_engine(game, engine, played_as, move_time)
     except FileNotFoundError:
         print(f"Stockfish not found at {stockfish_path}. Install with: brew install stockfish")
         return _annotate_no_engine(game, played_as)
+
+
+def _configure_engine(engine, config):
+    """Stockfish defaults to 1 thread / 16MB hash — give it more CPU so each
+    timed search goes much deeper. Two analysis jobs can run concurrently,
+    so leave roughly half the cores free."""
+    threads = config.get('stockfish_threads') or max(1, (os.cpu_count() or 4) // 2 - 1)
+    try:
+        engine.configure({'Threads': threads, 'Hash': 256})
+    except Exception as e:
+        print(f"Stockfish configure failed (using defaults): {e}")
 
 
 def _annotate_with_engine(game, engine, played_as, move_time):
@@ -207,6 +220,7 @@ def get_best_move(fen, config):
     try:
         board = chess.Board(fen)
         with chess.engine.SimpleEngine.popen_uci(stockfish_path) as engine:
+            _configure_engine(engine, config)
             infos = engine.analyse(board, chess.engine.Limit(time=move_time), multipv=1)
             if isinstance(infos, list):
                 info = infos[0]

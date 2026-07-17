@@ -1,5 +1,6 @@
 """Aggregates mistake patterns across multiple analyzed games and generates a coaching report."""
 
+import datetime
 import json
 import sqlite3
 
@@ -48,7 +49,8 @@ def _aggregate_stats(username, db_path):
     conn.row_factory = sqlite3.Row
     try:
         rows = conn.execute(
-            """SELECT g.played_as, g.result, g.time_class, g.opening, g.eco, a.moves_json
+            """SELECT g.played_as, g.result, g.time_class, g.opening, g.eco,
+                      g.opponent, g.end_time, a.moves_json
                FROM games g
                JOIN analysis a ON g.id = a.game_id
                WHERE g.username = ? AND a.moves_json IS NOT NULL""",
@@ -83,6 +85,10 @@ def _aggregate_stats(username, db_path):
         played_as  = row['played_as']
         time_class = row['time_class'] or 'unknown'
         opening    = row['opening'] or 'Unknown'
+
+        # Build a short game label for sample citations
+        _date = datetime.datetime.fromtimestamp(row['end_time']).strftime('%-m/%-d') if row['end_time'] else '?'
+        _game_label = f"vs {row['opponent'] or '?'} ({_date}, {row['result']})"
 
         color_stats[played_as]['total'] += 1
         if row['result'] == 'win':
@@ -125,12 +131,12 @@ def _aggregate_stats(username, db_path):
                 opening_stats[opening]['blunders'] += 1
                 exp = m.get('explanation')
                 if exp and len(blunder_samples) < 25:
-                    blunder_samples.append(f"Move {mn}: {exp}")
+                    blunder_samples.append(f"[{_game_label}] Move {mn}: {exp}")
             elif c == 'mistake':
                 mistakes += 1
                 exp = m.get('explanation')
                 if exp and len(mistake_samples) < 15:
-                    mistake_samples.append(f"Move {mn}: {exp}")
+                    mistake_samples.append(f"[{_game_label}] Move {mn}: {exp}")
             elif c == 'inaccuracy':
                 inaccuracies += 1
 
