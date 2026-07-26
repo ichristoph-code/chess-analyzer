@@ -1,4 +1,4 @@
-const CACHE_NAME = 'chess-analyzer-shell-v3';
+const CACHE_NAME = 'chess-analyzer-shell-v4';
 const SHELL_ASSETS = [
   '/',
   '/manifest.json',
@@ -6,6 +6,8 @@ const SHELL_ASSETS = [
   '/static/js/app.js',
   '/static/img/icon-192.png',
   '/static/img/icon-512.png',
+  '/static/img/icon-180.png',
+  '/static/img/favicon-32.png',
   '/static/img/chesspieces/wK.png',
   '/static/img/chesspieces/wQ.png',
   '/static/img/chesspieces/wR.png',
