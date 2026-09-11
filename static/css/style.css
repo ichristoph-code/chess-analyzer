@@ -725,13 +725,19 @@ body {
   transform: rotate(180deg);
 }
 
+/* The collapse animation works by tweening max-height, so the expanded state
+   needs a real cap. A fixed 300px silently clipped longer overviews (stats +
+   summary + coaching cards). Cap relative to the viewport instead and let the
+   body scroll when the content is taller than that. */
 #game-overview-body {
-  overflow: hidden;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
   transition: max-height 0.25s ease;
-  max-height: 300px;
+  max-height: 50vh;
 }
 #game-overview-section.collapsed #game-overview-body {
   max-height: 0;
+  overflow: hidden;
 }
 
 #game-overview-text {
@@ -1547,6 +1553,11 @@ body {
   #analysis-header {
     padding: 12px 14px 10px;
     flex-shrink: 0;
+  }
+
+  /* Overview takes at most ~a third of the screen; scrolls inside if longer */
+  #game-overview-body {
+    max-height: 34vh;
   }
 
   /* Commentary scrolls within ~40% of screen; rest goes to chat */
