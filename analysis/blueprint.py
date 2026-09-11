@@ -46,29 +46,36 @@ PHASE_LABELS = {
 
 
 def generate_blueprint(username, db_path, config=None):
-    """Return a structured learning blueprint from Stockfish + commentary data."""
+    """Rank observable preferred-move features, never motifs inferred from prose."""
+    from analysis.coaching import move_lesson, priority
     rows = _load_analyzed_games(username, db_path)
-    if not rows:
-        return {
-            'ready': False,
-            'summary': 'Analyze a few games to build your chess improvement blueprint.',
-            'focus_areas': [],
-            'metrics': [],
-            'next_steps': [],
-        }
-
-    stats = _collect_stats(rows)
-    focus_areas = _build_focus_areas(stats)
-    metrics = _build_metrics(stats)
-    next_steps = _build_next_steps(focus_areas, stats)
-
-    return {
-        'ready': True,
-        'summary': _summary(stats, focus_areas),
-        'focus_areas': focus_areas,
-        'metrics': metrics,
-        'next_steps': next_steps,
-    }
+    buckets = {}
+    evaluated_games = 0
+    for row in rows:
+        try:
+            moves = json.loads(row['moves_json'])
+        except (TypeError, ValueError):
+            continue
+        evaluated = [m for m in moves if m.get('color') == row['played_as'] and m.get('eval_after') is not None]
+        if not evaluated:
+            continue
+        evaluated_games += 1
+        for m in evaluated:
+            if m.get('classification') not in ('inaccuracy', 'mistake', 'blunder') or not m.get('best_move'):
+                continue
+            lesson = move_lesson(m)
+            bucket = buckets.setdefault(lesson['concept'], {'count': 0, 'games': set(), 'weight': 0, 'practice': lesson['practice']})
+            bucket['count'] += 1
+            bucket['games'].add(row['id'])
+            bucket['weight'] += priority(m)
+    ranked = sorted(buckets.items(), key=lambda item: (len(item[1]['games']), item[1]['weight']), reverse=True)[:2]
+    areas = [{'id': str(i), 'title': concept,
+              'why': f"{data['count']} review positions in {len(data['games'])} of {evaluated_games} evaluated games have a preferred move with this feature. This is a practice theme, not a proven cause of the errors.",
+              'practice': data['practice']} for i, (concept, data) in enumerate(ranked)]
+    return {'ready': bool(evaluated_games),
+            'summary': 'Your practice priorities, drawn from the moves in your saved games.' if evaluated_games else 'Analyze a game to build your practice priorities.',
+            'focus_areas': areas, 'metrics': [{'label': 'Evaluated games', 'value': str(evaluated_games)}],
+            'next_steps': ['Spend five minutes replaying one review position without the engine arrow. Name two candidates and a reply to each, then compare.'] if areas else []}
 
 
 def _load_analyzed_games(username, db_path):

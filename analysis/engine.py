@@ -13,7 +13,7 @@ MISTAKE_THRESHOLD    = 300
 BLUNDER_THRESHOLD    = 600
 
 # For adaptive depth: positions where the player lost this much (cp) get deeper analysis.
-CRITICAL_SWING_THRESHOLD = 200
+CRITICAL_SWING_THRESHOLD = INACCURACY_THRESHOLD
 
 
 def annotate_game(pgn_str, played_as, config, progress_cb=None):
@@ -126,8 +126,13 @@ def _annotate_with_engine(game, engine, played_as, move_time, progress_cb=None):
                     continue
                 cp = _to_cp(info['score'], chess.WHITE)
                 pv_line = _pv_to_san(b, pv, max_len=6)
-                candidates.append({'san': san, 'cp': cp, 'pv_line': pv_line})
+                candidates.append({'san': san, 'uci': pv[0].uci(), 'cp': cp, 'pv_line': pv_line})
+            # Compare the deeper preferred line with the played move at the same budget.
+            after = b.copy()
+            after.push(nodes[i].move)
+            after_info = engine.analyse(after, chess.engine.Limit(time=critical_time))
             deep_data[i] = {
+                'score_after': _to_cp(after_info['score'], chess.WHITE),
                 'candidates': candidates,
                 'pv_line': candidates[0]['pv_line'] if candidates else [],
             }
@@ -161,6 +166,15 @@ def _annotate_with_engine(game, engine, played_as, move_time, progress_cb=None):
         delta = (score_before - score_after) if mover == 'white' else (score_after - score_before)
 
         deep = deep_data.get(move_index, {})
+        if deep.get('candidates'):
+            preferred = deep['candidates'][0]
+            best_move_san = preferred['san']
+            best_move_uci_str = preferred['uci']
+            score_before = preferred['cp']
+            score_after = deep['score_after']
+            delta = (score_before - score_after) if mover == 'white' else (score_after - score_before)
+        if best_move_uci_str == move.uci():
+            delta = 0  # independent timed searches can otherwise penalize the recommended move
 
         moves.append({
             'move_number': (move_index // 2) + 1,

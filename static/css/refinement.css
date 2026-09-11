@@ -1,0 +1,81 @@
+/* Quiet graphite surfaces; the position and teaching carry the emphasis. */
+:root { --bg:#111315; --surface-1:#181b1e; --card:#202428; --accent:#9bb9ca; --accent-strong:#42667b; --accent-soft:rgba(155,185,202,.12); --accent-text:#c1d6e1; --text:#edeff0; --muted:#a1a9af; --border:rgba(255,255,255,.10); --radius:10px; }
+body { background:var(--bg); }
+#nav { background:rgba(24,27,30,.94); padding-top:calc(14px + env(safe-area-inset-top)); padding-bottom:14px; }
+#nav h1 { font-weight:500; letter-spacing:-.5px; }
+#btn-fetch { background:#dae5eb; color:#17252e; box-shadow:none; }
+#model-switch { background:transparent; }
+#nav #model-switch button.active { background:#35434d; }
+#game-list-panel, #analysis-panel, #coach-panel { background:var(--surface-1); }
+#board-panel { background:var(--bg); }
+#game-list-panel h2, #analysis-coach-label { text-transform:uppercase; letter-spacing:1.5px; font-size:10px; color:var(--muted); }
+.game-item { border-radius:8px; box-shadow:none; }
+.game-item.active { background:var(--accent-soft); border-color:var(--accent); }
+#analysis-header, #analysis-body, #game-overview-section { padding:20px; }
+#analysis-comment { font-size:14px; line-height:1.75; }
+#game-overview-text { font-size:13px; line-height:1.7; }
+#game-overview-section { max-height:42vh; overflow:auto; flex-shrink:0; }
+#game-overview-header { font-weight:500; letter-spacing:0; }
+#analysis-body { overflow-y:auto; min-height:160px; }
+#analysis-footer, #chat-panel { background:var(--surface-1); }
+#board { border-radius:4px; box-shadow:0 12px 36px #0003; }
+.sq.light { background:#d9dedb; } .sq.dark { background:#718b8a; }
+.sq.light.highlight { background:#cbd7b1; } .sq.dark.highlight { background:#91a782; }
+.review-moments { display:flex; gap:6px; flex-wrap:wrap; margin:12px 0; }
+.review-moments button, .line-step { background:var(--card); color:var(--accent-text); border:1px solid var(--border); padding:8px 10px; border-radius:7px; cursor:pointer; font:inherit; }
+.review-moments button:hover, .line-step:hover { border-color:var(--accent); }
+.review-practice { margin-top:12px; padding-left:12px; border-left:2px solid var(--accent); color:var(--text); }
+.review-caption { display:block; font-size:11px; color:var(--muted); margin-top:10px; }
+#move-concept { border-bottom:1px solid var(--border); margin-bottom:16px; padding-bottom:16px; }
+#move-concept h3 { font-size:17px; font-weight:500; letter-spacing:-.3px; margin:0 0 8px; }
+#move-concept p { font-size:13px; line-height:1.7; margin-bottom:10px; }
+#move-concept details { margin-top:12px; font-size:12px; }
+#move-concept summary { cursor:pointer; color:var(--accent-text); }
+.line-steps { display:flex; flex-wrap:wrap; gap:5px; margin-top:10px; }
+#variation-status { color:var(--accent-text); font-size:12px; padding:8px; text-align:center; }
+#variation-status button { background:transparent; color:inherit; border:0; text-decoration:underline; cursor:pointer; margin-left:10px; }
+.stat-chip { background:transparent; border:0; padding:0 8px 0 0; font-size:11px; }
+#move-nav button { min-width:34px; min-height:36px; }
+@media (max-width:768px) { #nav { padding-left:12px; padding-right:12px; } #nav h1 { font-size:14px; } #analysis-body { min-height:220px; } #game-overview-section { max-height:none; } #move-nav { gap:3px; } #move-nav button { min-width:30px; } }
+@media (prefers-reduced-motion:reduce) { *, *::before, *::after { transition:none!important; animation:none!important; scroll-behavior:auto!important; } }
+/* One continuous reading surface avoids clipped notes and nested scroll traps. */
+#analysis-panel { overflow-y:auto; }
+#analysis-body { height:auto !important; max-height:none; overflow:visible; flex:0 0 auto; }
+#game-overview-section { max-height:none; overflow:visible; }
+#analysis-body-resize { display:none; }
+#chat-panel { flex:0 0 auto; min-height:140px; }
+#chat-thread { max-height:280px; }
+@media (max-width:768px) {
+  #nav h1 { font-size:0; gap:6px; flex:1; min-width:70px; }
+  #nav h1::after { content:'Chess'; font-size:14px; }
+  #nav .nav-app-icon { width:24px; height:24px; }
+  #analysis-panel { overflow-y:auto; }
+  #analysis-body { min-height:0; max-height:none; }
+  #analysis-header, #analysis-body, #game-overview-section { padding:18px; }
+}
+
+/* Give the lesson a clear reading order; secondary analysis stays within reach. */
+.lesson-eyebrow { display:block; font-size:10px; letter-spacing:1.2px; text-transform:uppercase; color:var(--muted); margin-bottom:10px; }
+.lesson-question { margin:16px 0; padding:14px; background:var(--accent-soft); border-radius:8px; }
+.lesson-action { background:var(--accent); color:var(--bg); border:0; border-radius:6px; padding:9px 12px; cursor:pointer; font:inherit; font-size:12px; }
+#move-concept .lesson-answer { font-size:13px; }
+#move-concept details p { margin-top:12px; }
+#commentary-details summary { cursor:pointer; padding:8px 0; }
+#commentary-details[open] summary { margin-bottom:10px; }
+.review-moments { flex-direction:column; }
+.review-moments button { text-align:left; display:flex; flex-direction:column; gap:5px; }
+.review-moments button span { font-size:11px; color:var(--muted); }
+.review-moments button strong { font-size:13px; font-weight:500; color:var(--text); }
+.review-moments button:first-child { border-color:var(--accent-strong); background:var(--accent-soft); }
+button:focus-visible, summary:focus-visible { outline:2px solid var(--accent); outline-offset:3px; }
+
+#analysis-panel.studying #analysis-header, #analysis-panel.studying #game-overview-section, #analysis-panel.studying #analysis-footer, #analysis-panel.studying #commentary-details { display:none !important; }
+
+.review-themes section { padding:16px 0; border-top:1px solid var(--border); }
+.review-themes h4, #move-concept h4 { font-size:13px; font-weight:500; color:var(--text); margin:14px 0 8px; }
+.review-themes .lesson-eyebrow { margin-bottom:6px; }
+.review-themes h4 { margin-top:0; }
+.theme-example { border:0; background:transparent; padding:8px 0; color:var(--accent-text); cursor:pointer; font:inherit; font-size:12px; }
+.lesson-evidence { padding-left:18px; font-size:13px; line-height:1.7; }
+.lesson-evidence li { margin:8px 0; }
+.lesson-principle { padding-left:12px; border-left:2px solid var(--accent); }

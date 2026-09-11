@@ -280,7 +280,38 @@ function renderBoard(fen, orientation, highlightSquares) {
 let currentGame      = null;     // full game object returned from /api/game/<id>
 let currentMoveIdx   = 0;        // 0 = start position, n = after n-th move in the list
 let boardOrientation = 'white';  // 'white' or 'black'; toggled by the flip button
-let pollTimer        = null;     // setInterval handle while waiting for background analysis
+let pollTimer        = null;     // setTimeout handle while waiting for background analysis
+let activeLoadToken  = 0;        // prevents a slower prior click replacing the latest game
+
+async function apiFetch(url, options = {}, timeoutMs = 20000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, {...options, signal: controller.signal});
+    let data;
+    try {
+      data = await response.json();
+    } catch {
+      throw new Error(`Server returned an unreadable response (${response.status})`);
+    }
+    if (!response.ok || data.error) {
+      throw new Error(data.error || `Request failed (${response.status})`);
+    }
+    return data;
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      throw new Error('The request took too long. The server may still be working.');
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function schedulePoll(callback, delay) {
+  stopPolling();
+  pollTimer = setTimeout(callback, delay);
+}
 
 // ---------------------------------------------------------------------------
 // Init
@@ -584,7 +615,7 @@ document.addEventListener('click', e => {
 async function fetchGames() {
   const btn = document.getElementById('btn-fetch');
   btn.disabled    = true;
-  btn.textContent = '…';
+  btn.textContent = 'Fetching…';
   try {
     const res  = await fetch('/api/games/fetch', { method: 'POST' });
     const data = await res.json();
@@ -595,7 +626,7 @@ async function fetchGames() {
     toast('Fetch failed: ' + e.message);
   } finally {
     btn.disabled    = false;
-    btn.textContent = '↓ Fetch';
+    btn.textContent = 'Fetch games';
   }
 }
 
@@ -604,6 +635,7 @@ async function fetchGames() {
 // ---------------------------------------------------------------------------
 
 async function loadGame(gameId) {
+  const loadToken = ++activeLoadToken;
   // Mark the selected game in the sidebar
   document.querySelectorAll('.game-item').forEach(el => {
     el.classList.toggle('active', el.dataset.id === gameId);
@@ -623,21 +655,22 @@ async function loadGame(gameId) {
 
   let game;
   try {
-    const res = await fetch(`/api/game/${gameId}`);
-    game = await res.json();
+    game = await apiFetch(`/api/game/${gameId}`);
   } catch (e) {
+    if (loadToken !== activeLoadToken) return;
     document.getElementById('analyzing-banner').style.display = 'none';
     document.getElementById('placeholder').style.display      = '';
-    toast('Could not load game — is the server running?');
+    toast('Could not load game: ' + e.message);
     return;
   }
+  if (loadToken !== activeLoadToken) return;
   currentGame = game;
 
   boardOrientation = game.played_as === 'black' ? 'black' : 'white';
 
   if (game.analyzing || !game.moves || !game.moves.length) {
     // Stockfish still running — keep full spinner, poll for completion
-    pollTimer = setInterval(() => checkAnalysisStatus(gameId), 2000);
+    schedulePoll(() => checkAnalysisStatus(gameId), 1200);
     return;
   }
 
@@ -646,33 +679,39 @@ async function loadGame(gameId) {
 
   if (game.commentary_pending) {
     // Claude commentary still generating — poll quietly until it arrives
-    pollTimer = setInterval(() => checkCommentaryStatus(gameId), 5000);
+    schedulePoll(() => checkCommentaryStatus(gameId), 2500);
   }
 }
 
 async function checkAnalysisStatus(gameId) {
   // Poll until Stockfish analysis is complete (analyzed=1)
   try {
-    const res  = await fetch(`/api/game/${gameId}/status`);
-    const data = await res.json();
+    const data = await apiFetch(`/api/game/${gameId}/status`);
     if (!data.analyzed) {
       updateAnalyzingProgress(data.progress);
+      if (!data.pending && data.error) {
+        stopPolling();
+        document.getElementById('analyzing-banner').style.display = 'none';
+        document.getElementById('placeholder').style.display = '';
+        toast('Analysis stopped: ' + data.error);
+        return;
+      }
+      schedulePoll(() => checkAnalysisStatus(gameId), 1200);
       return;
     }
     stopPolling();
     playChime();
     loadGameList();
     // Re-fetch full game data and render board
-    const res2  = await fetch(`/api/game/${gameId}`);
-    const game2 = await res2.json();
+    const game2 = await apiFetch(`/api/game/${gameId}`);
     currentGame = game2;
     renderGame(game2);
     if (game2.commentary_pending) {
-      pollTimer = setInterval(() => checkCommentaryStatus(gameId), 5000);
+      schedulePoll(() => checkCommentaryStatus(gameId), 2500);
     }
   } catch (e) {
-    // transient network error (e.g. server reloading) — keep polling
     console.warn('Status poll failed:', e);
+    schedulePoll(() => checkAnalysisStatus(gameId), 2500);
   }
 }
 
@@ -680,9 +719,19 @@ async function checkCommentaryStatus(gameId) {
   // Poll until Claude commentary is ready — or until the server gives up
   // (commentary_pending goes false with claude_ok still 0).
   try {
-    const res  = await fetch(`/api/game/${gameId}`);
-    const game = await res.json();
-    if (game.commentary_pending) return;
+    const status = await apiFetch(`/api/game/${gameId}/status`);
+    if (status.pending && status.stage === 'commentary') {
+      schedulePoll(() => checkCommentaryStatus(gameId), 2500);
+      return;
+    }
+
+    // Fetch the much larger move payload only when the background task has
+    // changed state. This endpoint may queue one bounded automatic retry.
+    const game = await apiFetch(`/api/game/${gameId}`);
+    if (game.commentary_pending) {
+      schedulePoll(() => checkCommentaryStatus(gameId), 2500);
+      return;
+    }
     stopPolling();
     currentGame = game;
     if (game.claude_ok) {
@@ -692,9 +741,12 @@ async function checkCommentaryStatus(gameId) {
       // Server exhausted its retries — show the failed state with a retry button
       document.getElementById('commentary-banner').style.display = 'none';
       document.getElementById('analysis-error').style.display    = 'flex';
+      const errorText = game.commentary_error || status.error;
+      if (errorText) toast('Commentary stopped: ' + errorText);
     }
   } catch (e) {
     console.warn('Commentary poll failed:', e);
+    schedulePoll(() => checkCommentaryStatus(gameId), 4000);
   }
 }
 
@@ -733,7 +785,7 @@ function playChime() {
 }
 
 function stopPolling() {
-  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
 }
 
 // Update the analyzing banner with live Stockfish progress from the server.
@@ -897,6 +949,8 @@ function renderMoveList(moves, playedAs) {
 // idx 0 = starting position (before any moves).
 // idx n = position after the n-th move in the moves array.
 function goToMove(idx) {
+  document.getElementById("variation-status").hidden = true;
+  document.getElementById("analysis-panel").classList.remove("studying");
   if (!currentGame || !currentGame.moves) return;
   const moves  = currentGame.moves;
   const target = Math.max(0, Math.min(idx, moves.length));
@@ -1001,7 +1055,7 @@ async function reAnalyzeGame() {
     document.getElementById('game-view').style.display        = 'none';
     document.getElementById('analysis-error').style.display   = 'none';
     stopPolling();
-    pollTimer = setInterval(() => checkAnalysisStatus(currentGame.id), 2000);
+    schedulePoll(() => checkAnalysisStatus(currentGame.id), 1200);
   } catch (e) {
     toast('Re-analysis failed: ' + e.message);
   } finally {
@@ -1073,7 +1127,7 @@ async function redoCommentary() {
     stopPolling();
     // Commentary keeps the Stockfish data — poll the commentary flag, not the
     // analyzed flag (which is already 1 and would fire instantly).
-    pollTimer = setInterval(() => checkCommentaryStatus(currentGame.id), 5000);
+    schedulePoll(() => checkCommentaryStatus(currentGame.id), 2500);
   } catch (e) {
     toast('Could not restart commentary: ' + e.message);
   } finally {
@@ -1225,12 +1279,14 @@ function drawEvalGraph(moves, playedAs, currentIdx) {
 // ---------------------------------------------------------------------------
 
 function findCriticalMoment(moves, playedAs) {
-  let maxDelta = 150;   // minimum threshold (1.5 pawns) to be "critical"
-  let critIdx  = -1;
+  let largestDrop = 0;
+  let critIdx = -1;
+  const chance = cp => 1 / (1 + Math.exp(-Math.max(-60, Math.min(60, cp / 250))));
   moves.forEach((m, i) => {
-    if (m.color !== playedAs) return;
-    const d = m.delta ?? 0;
-    if (d > maxDelta) { maxDelta = d; critIdx = i; }
+    if (m.color !== playedAs || !['inaccuracy', 'mistake', 'blunder'].includes(m.classification) ||
+        m.eval_before == null || m.eval_after == null) return;
+    const drop = Math.max(0, chance(m.eval_before) - chance(m.eval_after));
+    if (drop > largestDrop) { largestDrop = drop; critIdx = i; }
   });
   return critIdx;
 }
@@ -1263,6 +1319,7 @@ function markCriticalMoment(idx) {
 // ---------------------------------------------------------------------------
 
 function showExplanation(move, playedAs) {
+  renderMoveConcept(move, playedAs);
   const isMyMove = move.color === playedAs;
   const cls      = isMyMove ? (move.classification || 'best') : 'opponent';
 
@@ -1282,6 +1339,7 @@ function showExplanation(move, playedAs) {
   // ── Comment (with brief fade) ──
   const commentEl = document.getElementById('analysis-comment');
   commentEl.style.opacity = '0';
+  document.getElementById('commentary-details').open = false;
   const isPending = currentGame && currentGame.commentary_pending;
   setTimeout(() => {
     if (move.explanation) {
@@ -1296,7 +1354,7 @@ function showExplanation(move, playedAs) {
     } else {
       const deltaP = move.delta ? (Math.abs(move.delta) / 100).toFixed(1) : null;
       commentEl.textContent = deltaP && cls !== 'best'
-        ? `${cls.charAt(0).toUpperCase() + cls.slice(1)} — lost about ${deltaP} pawns of advantage.`
+        ? `${cls.charAt(0).toUpperCase() + cls.slice(1)} — evaluation dropped by about ${deltaP} pawn units. This measures the position, not pieces captured.`
         : 'No detailed commentary available for this move.';
       commentEl.classList.add('muted');
     }
@@ -1316,15 +1374,16 @@ function showExplanation(move, playedAs) {
   // ── Footer: eval ──
   const evalEl = document.getElementById('analysis-eval');
   if (move.eval_after !== null && move.eval_after !== undefined) {
-    const p    = (move.eval_after / 100).toFixed(1);
-    const sign = move.eval_after >= 0 ? '+' : '';
-    evalEl.textContent = `Position: ${sign}${p} pawns`;
+    const cp = move.eval_after * (isMyMove ? 1 : -1);
+    const p = (cp / 100).toFixed(1);
+    evalEl.textContent = Math.abs(cp) >= 2900 ? `Mating evaluation · ${cp > 0 ? 'in your favor' : 'against you'}` : `Your perspective: ${cp >= 0 ? '+' : ''}${p} · engine evaluation`;
   } else {
     evalEl.textContent = '';
   }
 }
 
 function clearExplanation() {
+  document.getElementById("move-concept").hidden = true;
   document.getElementById('analysis-move-label').textContent  = 'Select a move';
   document.getElementById('classification-badge').className   = 'badge';
   document.getElementById('classification-badge').textContent = '';
@@ -1388,7 +1447,7 @@ function renderGameStats(game) {
   }
   el.style.display = '';
   el.innerHTML = `
-    <span class="stat-chip stat-accuracy" title="Estimated accuracy from average centipawn loss">Accuracy ${stats.accuracy}%</span>
+    <span class="stat-chip stat-accuracy" title="Approximate score from evaluation changes; not an official chess.com accuracy">Estimated accuracy ${stats.accuracy}%</span>
     <span class="stat-chip" title="Average centipawn loss per move">Avg loss ${stats.acpl}cp</span>
     <span class="stat-chip stat-blunder" title="Blunders">${stats.blunder} ??</span>
     <span class="stat-chip stat-mistake" title="Mistakes">${stats.mistake} ?</span>
@@ -1406,7 +1465,11 @@ function renderGameOverview(game) {
 
   section.style.display = '';
   renderGameStats(game);
-  if (game.game_summary) {
+  if (game.review) {
+    const r = game.review;
+    textEl.innerHTML = `<p>${escHtml(r.summary)}</p><div class="review-moments">${(r.moments || []).map(m => `<button onclick="goToMove(${Number(m.idx)}); if(isMobileLayout()) setMobileTab('board')" title="${escHtml(m.concept)}"><span>${m.kind === 'reinforce' ? 'Keep doing' : m.priority === 1 ? 'Start here' : 'Then review'} · ${escHtml(m.label)}</span><strong>${escHtml(m.concept)}</strong></button>`).join('')}</div>${r.themes?.length ? `<div class="review-themes">${r.themes.map(t => `<section><span class="lesson-eyebrow">${t.kind === 'reinforce' ? 'Keep doing' : 'Build this habit'}</span><h4>${escHtml(t.concept)}</h4><p>${escHtml(t.principle)}</p><p class="review-practice">${escHtml(t.practice)}</p><button class="theme-example" onclick="goToMove(${Number(t.idx)}); if(isMobileLayout()) setMobileTab('analysis')">See example · ${escHtml(t.label)}</button></section>`).join('')}</div>` : `<p class="review-practice"><strong>Next game</strong><br>${escHtml(r.practice)}</p>`}<small class="review-caption">${escHtml(r.coverage || 'No engine evaluation')}</small>`;
+    textEl.classList.remove('muted');
+  } else if (game.game_summary) {
     textEl.textContent = game.game_summary;
     textEl.classList.remove('muted');
   } else if (game.commentary_pending) {
@@ -1433,19 +1496,8 @@ function toggleCoach() {
 async function loadCoach() {
   const el = document.getElementById('coach-content');
 
-  // Prefer the Claude-generated patterns report (deep personal analysis)
-  try {
-    const res  = await fetch('/api/patterns');
-    const data = await res.json();
-    if (data.report) {
-      renderPatterns(data.report, data.generated_at);
-      return;
-    }
-  } catch (e) {
-    console.warn('Patterns unavailable:', e);
-  }
-
-  // Fall back to rule-based blueprint if no Claude report yet
+  // Prefer freshly computed evidence over potentially stale generated reports.
+  // Local coaching uses saved engine facts and does not request paid commentary.
   try {
     const blueprintRes = await fetch('/api/blueprint');
     const blueprint = await blueprintRes.json();
@@ -1467,7 +1519,7 @@ function renderPatterns(report, generated_at) {
 
   if (generated_at) {
     const date = new Date(generated_at * 1000).toLocaleDateString();
-    document.getElementById('coach-title').textContent = `♟ Coach · ${date}`;
+    document.getElementById('coach-title').textContent = `Coach report · ${date}`;
   }
 
   // Prepend a "cross-game analysis" label so it's clear this isn't about the current game
@@ -1553,7 +1605,7 @@ async function refreshCoach() {
       await loadCoach();
       if (data.generated_at) {
         const date = new Date(data.generated_at * 1000).toLocaleDateString();
-        document.getElementById('coach-title').textContent = `♟ Coach · ${date}`;
+        document.getElementById('coach-title').textContent = `Coach report · ${date}`;
       }
     }
   }, 3000);
@@ -1801,4 +1853,49 @@ function toast(msg) {
     el.classList.add('fade');
     setTimeout(() => el.remove(), 300);
   }, 2800);
+}
+
+
+function renderMoveConcept(move, playedAs) {
+  const el = document.getElementById('move-concept');
+  const lesson = move.lesson;
+  el.hidden = !lesson || move.color !== playedAs;
+  if (el.hidden) return;
+  el.innerHTML = `<span class="lesson-eyebrow">${lesson.kind === 'reinforce' ? 'A decision worth repeating' : lesson.kind === 'improve' ? 'Learn from this decision' : 'Explore this decision'}</span><h3>${escHtml(lesson.concept)}</h3>
+    ${lesson.question ? `<div class="lesson-question"><p>${escHtml(lesson.question)}</p><button class="lesson-action" onclick="studyPosition()">Think from the position</button></div>` : ''}
+    <details class="lesson-answer"><summary>Reveal the lesson</summary>
+      ${lesson.principle ? `<p class="lesson-principle">${escHtml(lesson.principle)}</p><h4>In this position</h4><ul class="lesson-evidence">${lesson.evidence.map(f => `<li>${escHtml(f)}</li>`).join('')}</ul><p class="review-caption">${escHtml(lesson.assessment)}</p>` : `<p>${escHtml(lesson.idea)}</p>`}
+      ${lesson.comparison ? `<h4>${escHtml(lesson.comparison.label)} · ${escHtml(lesson.comparison.move)}</h4><ul class="lesson-evidence">${lesson.comparison.evidence.map(f => `<li>${escHtml(f)}</li>`).join('')}</ul>` : ''}
+      ${lesson.boundary ? `<h4>When the rule needs care</h4><p>${escHtml(lesson.boundary)}</p>` : ''}
+    </details>
+    <details><summary>Ask yourself next time</summary><p>${escHtml(lesson.practice)}</p></details>
+    ${(lesson.line || []).length ? `<details><summary>${escHtml(lesson.line_label || 'Engine continuation')}</summary><div class="line-steps">${lesson.line.map((step, i) => `<button class="line-step" onclick="previewLine(${i})">${escHtml(step.san)}</button>`).join('')}</div><small class="review-caption">A best-play sample, not a forced prediction.</small></details>` : '<small class="review-caption">No verified continuation saved for this move.</small>'}`;
+}
+function revealStudy() {
+  goToMove(currentMoveIdx);
+  const answer = document.querySelector('#move-concept .lesson-answer');
+  if (answer) answer.open = true;
+  if (isMobileLayout()) setMobileTab('analysis');
+}
+function studyPosition() {
+  const move = currentGame?.moves?.[currentMoveIdx - 1];
+  if (!move?.lesson?.fen_before) return;
+  renderBoard(move.lesson.fen_before, boardOrientation, null);
+  drawMoveArrows(null, null, boardOrientation, null);
+  document.querySelector('#move-concept .lesson-answer').open = false;
+  document.getElementById("analysis-panel").classList.add("studying");
+  const status = document.getElementById('variation-status');
+  status.hidden = false;
+  status.innerHTML = `${escHtml(move.color === 'white' ? 'White' : 'Black')} to move · Compare two candidates <button onclick="revealStudy()">Reveal & return</button>`;
+  if (isMobileLayout()) setMobileTab('board');
+}
+function previewLine(step) {
+  const line = currentGame?.moves?.[currentMoveIdx - 1]?.lesson?.line;
+  if (!line?.[step]) return;
+  renderBoard(line[step].fen, boardOrientation, null);
+  drawMoveArrows(null, null, boardOrientation, null);
+  const status = document.getElementById('variation-status');
+  status.hidden = false;
+  status.innerHTML = `Engine variation · ${escHtml(line[step].san)} <button onclick="goToMove(currentMoveIdx)">Return to game</button>`;
+  if (isMobileLayout()) setMobileTab('board');
 }

@@ -7,9 +7,13 @@ import sqlite3
 import anthropic
 
 SYSTEM_PROMPT = (
+    "Never infer playing speed from error counts or claim a format is harmful without exposure-adjusted rates. "
+    "A moved piece is not necessarily the piece lost. Historical explanations are unverified, not proof of tactical motifs. "
+    "Do not recommend captures just because they use a pawn, promise rating gains, or invent recurrence counts. "
+
     "You are a patient chess coach for a low-level adult player who wants big-picture guidance. "
     "Stockfish has already identified the objective mistakes; your job is to turn those facts into concepts, habits, and a practice plan. "
-    "Write 6 specific, actionable coaching observations as bullet points starting with •. "
+    "Write up to 3 evidence-supported, actionable coaching observations as bullet points starting with •. "
     "Each bullet should name the recurring concept first, then explain how it showed up in the player's games. "
     "Use beginner-friendly chess language: hanging pieces, missed threats, development, king safety, trades, pawn structure, and simple tactics. "
     "Reference actual sample explanations when they reveal a pattern, but do not drown the player in engine lines. "
@@ -142,7 +146,7 @@ def _aggregate_stats(username, db_path):
 
         for m in opp_moves:
             delta = m.get('delta') or 0
-            if delta >= 200:
+            if delta <= -200:
                 exp = m.get('explanation')
                 if exp and len(opp_strong_moves) < 10:
                     opp_strong_moves.append(f"Move {m.get('move_number','?')}: {exp}")
@@ -183,7 +187,7 @@ def _build_prompt(s):
         f"- Mistakes: {s['mistakes']}, Inaccuracies: {s['inaccuracies']}",
         f"- Blunders by phase — Opening: {s['phase']['opening']}, "
         f"Middlegame: {s['phase']['middlegame']}, Endgame: {s['phase']['endgame']}",
-        f"- Most blunder-prone phase: {worst_phase}",
+        f"- Phase with the most recorded errors (not adjusted for moves played): {worst_phase}",
     ]
 
     if s['piece_blunders']:
@@ -193,7 +197,7 @@ def _build_prompt(s):
 
     if s['time_class_errors']:
         worst_tc = max(s['time_class_errors'], key=s['time_class_errors'].get)
-        lines.append(f"- Most errors in {worst_tc} games ({s['time_class_errors'][worst_tc]} total errors)")
+        lines.append(f"- Largest raw error count in {worst_tc} games ({s['time_class_errors'][worst_tc]} total errors)")
 
     # Opening performance (only openings with ≥3 games)
     notable_openings = {k: v for k, v in s['opening_stats'].items()
@@ -223,7 +227,7 @@ def _build_prompt(s):
 
     lines += [
         "",
-        "Based on ALL of the above, write 6 specific bullet point coaching recommendations. "
+        "Based on ALL of the above, write up to 3 evidence-supported coaching recommendations. "
         "Reference the actual explanations above — look for recurring themes. Be concrete. "
         "If you see repeated tactical motifs in the blunder samples (forks, hanging pieces, pins), "
         "call them out by name. If the opening data shows a pattern, address it."
@@ -254,7 +258,7 @@ def get_player_weakness_summary(username, db_path, max_games=25):
 
     if stats['piece_blunders']:
         sorted_pieces = sorted(stats['piece_blunders'].items(), key=lambda x: -x[1])
-        lines.append("Most blundered pieces: " +
+        lines.append("Pieces moved on error moves (not necessarily pieces lost): " +
                      ', '.join(f"{piece_names.get(p, p)} ({n}×)" for p, n in sorted_pieces[:4]))
 
     w = stats['color_stats']['white']
@@ -282,7 +286,7 @@ def get_player_weakness_summary(username, db_path, max_games=25):
     lines += [
         "",
         "If the move being explained matches a recurring pattern above, explicitly say so: "
-        "'This is another instance of your tendency to...' or 'You've made this type of error N times recently.'",
+        "'This resembles an earlier review example.' Do not invent frequencies.",
         "If it's a new type of error, note that too.",
         "=== END PLAYER PROFILE ===",
     ]

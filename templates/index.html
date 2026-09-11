@@ -11,11 +11,12 @@
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="apple-mobile-web-app-title" content="Chess">
-  <meta name="theme-color" content="#1a1a2e">
+  <meta name="theme-color" content="#181b1e">
   <link rel="apple-touch-icon" sizes="180x180" href="/static/img/icon-180.png">
   <link rel="icon" type="image/png" sizes="32x32" href="/static/img/favicon-32.png">
 
-  <link rel="stylesheet" href="/static/css/style.css">
+  <link rel="stylesheet" href="/static/css/style.css?v={{ static_version }}">
+  <link rel="stylesheet" href="/static/css/refinement.css?v={{ static_version }}">
 </head>
 <body>
 
@@ -23,13 +24,13 @@
 
   <!-- Nav bar -->
   <nav id="nav">
-    <h1><span class="nav-knight">♞</span> Ian's Chess Analyzer</h1>
+    <h1><img class="nav-app-icon" src="/static/img/favicon-32.png" alt=""> Chess Analyzer</h1>
     <div id="nav-actions">
       <div id="model-switch" role="group" aria-label="Coach model">
         <button id="model-sonnet" onclick="setCoachModel('sonnet')" title="Use cheaper Sonnet model">Sonnet</button>
         <button id="model-opus" onclick="setCoachModel('opus')" title="Use richer Opus model">Opus</button>
       </div>
-      <button id="btn-fetch" onclick="fetchGames()">↓ Fetch</button>
+      <button id="btn-fetch" onclick="fetchGames()">Fetch games</button>
       <div id="nav-menu-wrap">
         <button id="btn-nav-menu" onclick="toggleNavMenu()" aria-haspopup="true" aria-expanded="false" title="More actions">⋯</button>
         <div id="nav-menu" role="menu">
@@ -93,6 +94,7 @@
       <div id="game-view" style="display:none">
         <div id="board-container">
           <div id="board"></div>
+          <div id="variation-status" hidden></div>
         </div>
 
         <!-- Eval graph -->
@@ -111,7 +113,7 @@
           </div>
           <div id="commentary-banner" style="display:none">
             <span class="spinner"></span>
-            Generating Claude commentary…
+            Writing coaching notes…
           </div>
           <div id="analysis-error" style="display:none">
             <span>⚠ Claude commentary failed</span>
@@ -145,7 +147,7 @@
       </div>
       <div id="game-overview-section" style="display:none">
         <div id="game-overview-header" onclick="toggleGameOverview()">
-          <span>Game Overview</span>
+          <span>The big picture</span>
           <span id="game-overview-chevron">▲</span>
         </div>
         <div id="game-overview-body">
@@ -155,10 +157,12 @@
       </div>
 
       <div id="analysis-body">
-        <div id="analysis-coach-label">Coach</div>
+        <div id="move-concept" hidden></div>
+        <details id="commentary-details"><summary id="analysis-coach-label">Additional commentary</summary>
         <div id="analysis-comment" class="muted">
           Select a game from the list, then navigate moves with ← → to see coaching commentary on each move.
         </div>
+        </details>
       </div>
       <div id="analysis-body-resize" title="Drag to resize"></div>
       <div id="analysis-footer">
@@ -173,7 +177,7 @@
       <div id="chat-panel">
         <div id="chat-thread"></div>
         <div id="chat-input-row">
-          <input id="chat-input" type="text" placeholder="Ask about this move…" autocomplete="off">
+          <input id="chat-input" type="text" aria-label="Ask your chess coach" placeholder="Why this move? What is the plan?" autocomplete="off">
           <button id="chat-send" onclick="sendChat()">↑</button>
         </div>
       </div>

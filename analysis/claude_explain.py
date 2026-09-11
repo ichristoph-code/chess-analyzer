@@ -10,38 +10,30 @@ import re
 import anthropic
 import chess
 
-SYSTEM_PROMPT = """\
-You are a personal chess coach writing commentary for a specific player whose recurring mistakes you know well.
-
-=== REQUIRED COMMENT STRUCTURE — follow this order for every mistake ===
-1. PATTERN CALL-OUT (1 sentence, always first): Does this match a weakness in the player profile? If yes, open with: "Again — [pattern name]." or "You've hit your [pattern] problem again." If it's new: "New pattern to watch: [brief name]."
-2. WHAT WENT WRONG (1-2 sentences): Explain the mistake in plain English using only the evaluation swing and Stockfish preference.
-3. WHAT TO DO INSTEAD (1 sentence): Name the Stockfish preferred move exactly as supplied, but do not explain it by reconstructing piece locations.
-
-Total: 3 sentences max. Short, sharp, personal.
-
-The player profile appears at the top of the user message — it lists their real recurring weaknesses from 27 games. Read it before writing anything.
-
-=== STYLE ===
-- Plain English. You may name the played move and the Stockfish preferred move, but do not name exact piece locations.
-- Lead with "you" language: "You missed...", "You walked into...", "You left your..."
-- Ruthlessly honest but not discouraging.
-
-=== ACCURACY RULES — strictly enforced ===
-- Every move block contains a BOARD STATE section listing every piece and its exact square, machine-generated from the FEN. Use this as your ground truth.
-- Every move block also contains MOVE FACTS confirming exactly what moved, what was captured, and whether pieces are newly hanging.
-- Do NOT use your own memory, the move sequence, or mental reconstruction to place pieces. Only use BOARD STATE and MOVE FACTS.
-- You may name a piece on a specific square only if that square appears in BOARD STATE or MOVE FACTS for that move.
-- Only name a tactical motif (fork, pin, skewer, etc.) if MOVE FACTS explicitly describes it. If no motif is listed, say "you gave up too much evaluation" or "you missed the steadier move."
-- Being less specific is always better than being wrong.
-
-Respond with ONLY valid JSON:
-{"comments": [{"idx": <integer>, "comment": "<string>"}, ...]}\
+SYSTEM_PROMPT = """You are a patient chess coach for an adult learner.
+For each requested move explain: the decision or problem, why the supplied preferred
+move helps, the opponent's strongest supplied reply, and one reusable thinking habit.
+Teach a transferable principle and why it applies to the supplied board evidence.
+Include when the principle can fail; do not merely name a motif or paraphrase the move.
+For a supported good example in the summary, describe what to repeat without assuming
+what the player thought. Balance one improvement lesson with one decision to keep making.
+Use 3-5 short sentences. Explain chess terms when first used. Never scold the player
+or declare a recurring weakness from one example. Historical commentary is context,
+not verified evidence of a motif or its frequency.
+Use only supplied board facts and legally replayed engine continuations for concrete
+claims. An attacked piece is not necessarily lost; sacrifices and pinned attackers
+require calculation. Do not invent a fork, forced win, or mate from an evaluation alone.
+If a continuation is missing, describe the verified move feature and acknowledge that
+its tactical justification needs calculation. Distinguish engine facts from general advice.
+The summary should connect the opening assessment, a meaningful change in prospects,
+and one practical habit. Do not presume that the opening was good or the largest raw
+centipawn loss decided the result. Missing evaluations mean unknown, not equal.
+Return only JSON: {"comments": [{"idx": 0, "comment": "..."}], "game_summary": "..."}.
 """
 
 # Moves that get auto-generated comments (no Claude needed)
-_AUTO_OPP_COMMENT = "Solid move — no immediate threat created."
-_PLAYER_GOOD_COMMENT = "Solid move — you kept the position steady and avoided giving your opponent an immediate tactical target."
+_AUTO_OPP_COMMENT = "No large evaluation loss detected for your opponent; check their threats before choosing a reply."
+_PLAYER_GOOD_COMMENT = "This move stayed within the configured error thresholds. Compare its plan with the engine preference."
 _PENDING_DETAIL_TEXT = "The detailed coach note is still being generated."
 
 
@@ -91,139 +83,70 @@ def finalize_fast_comments(moves, played_as):
     return moves
 
 
-GAME_SUMMARY_SYSTEM = """\
-You are a personal chess coach writing a brief overall assessment of a complete game.
-
-Write 3–5 sentences covering:
-1. How the opening went (solid, equal, shaky, aggressive) and when the game first became unbalanced
-2. When the decisive turning point arrived and what caused it — name the phase (opening/middlegame/endgame)
-3. One overarching coaching takeaway the player should carry to their next game
-
-Use "you" language throughout. Be concrete but do NOT name piece squares unless they appear in the provided move data. Keep it under 90 words. Return ONLY the plain narrative text — no JSON, no headers, no bullet points.\
-"""
-
-
-def generate_game_summary(moves, played_as, config, game_result='unknown',
-                           player_profile=None, opening=None):
-    """Return a 3–5 sentence holistic game assessment, or None on failure."""
-    api_key = config.get('anthropic_api_key')
-    if not api_key or not moves:
-        return None
-
-    client = anthropic.Anthropic(api_key=api_key)
-
-    move_seq   = _build_move_sequence(moves)
-    milestones = _eval_milestones(moves, played_as)
-
-    blunders     = sum(1 for m in moves if m.get('color') == played_as and m.get('classification') == 'blunder')
-    mistakes     = sum(1 for m in moves if m.get('color') == played_as and m.get('classification') == 'mistake')
-    inaccuracies = sum(1 for m in moves if m.get('color') == played_as and m.get('classification') == 'inaccuracy')
-
-    profile_block = f"PLAYER PROFILE (recurring patterns from prior games):\n{player_profile}\n\n" if player_profile else ""
-    opening_line  = f"Opening: {opening}\n" if opening else ""
-
-    user_prompt = (
-        f"{profile_block}"
-        f"Game: I played as {played_as}. Result: {game_result}. {opening_line}"
-        f"Move count: {len(moves)}\n"
-        f"My errors: {blunders} blunder(s), {mistakes} mistake(s), {inaccuracies} inaccuracy(ies)\n\n"
-        f"Full move sequence:\n{move_seq}\n\n"
-        f"Evaluation curve milestones (from {played_as}'s perspective; positive = I am better):\n"
-        f"{milestones}\n\n"
-        "Write a 3–5 sentence holistic game assessment for this player."
-    )
-
-    model = config.get('explain_model', 'claude-sonnet-4-6')
-    kwargs = {
-        'model': model,
-        'max_tokens': 400,
-        'system': GAME_SUMMARY_SYSTEM,
-        'messages': [{'role': 'user', 'content': user_prompt}],
-        'timeout': config.get('explain_timeout', 180),
-    }
-    if 'opus' in model:
-        kwargs['thinking']      = {'type': 'adaptive'}
-        kwargs['output_config'] = {'effort': 'high'}
-        kwargs['max_tokens']    = 800
-
-    try:
-        response = client.messages.create(**kwargs)
-        text = next((b.text for b in response.content if getattr(b, 'type', None) == 'text'), '').strip()
-        return text or None
-    except Exception as e:
-        print(f"Game summary generation failed: {e}")
-        return None
-
-
-def _eval_milestones(moves, played_as):
-    """Compact eval-curve description: phase boundaries + big swings."""
-    lines = []
-
-    # eval_before/eval_after are stored from the MOVER's perspective.
-    # Convert to the player's perspective: flip the sign on opponent moves.
-    def _fmt(cp, mover_color):
-        v = (cp if mover_color == played_as else -cp) / 100
-        return f"{'+' if v >= 0 else ''}{v:.1f}"
-
-    seen_phases = {}
-    for m in moves:
-        ph = _phase(m['move_number'])
-        if ph not in seen_phases:
-            ev = m.get('eval_before')
-            if ev is not None:
-                seen_phases[ph] = (m['move_number'], ev)
-                lines.append(f"  Start of {ph} (move {m['move_number']}): {_fmt(ev, m['color'])}")
-
-    last = moves[-1]
-    ev = last.get('eval_after')
-    if ev is not None:
-        lines.append(f"  Final (move {last['move_number']}): {_fmt(ev, last['color'])}")
-
-    for m in moves:
-        delta = abs(m.get('delta') or 0)
-        if delta >= 150 and m.get('eval_before') is not None and m.get('eval_after') is not None:
-            whose = 'my' if m['color'] == played_as else "opponent's"
-            lines.append(
-                f"  Move {m['move_number']} ({whose} {m['san']}): "
-                f"{_fmt(m['eval_before'], m['color'])} → {_fmt(m['eval_after'], m['color'])} "
-                f"[{m.get('classification', '?')}]"
-            )
-
-    return '\n'.join(lines) if lines else '  (no eval data available)'
+def build_local_game_summary(moves, played_as, game_result='unknown', opening=None):
+    """Return an immediate, deterministic overview without another API call."""
+    from analysis.coaching import enrich_game
+    review = enrich_game(moves or [], played_as)
+    return review['summary'] + ' ' + review['practice']
 
 
 def explain_game(moves, played_as, config, game_result='unknown', player_profile=None):
     """Ask Claude only for important player mistakes; keep local notes elsewhere."""
+    moves, _ = explain_game_with_summary(
+        moves, played_as, config,
+        game_result=game_result,
+        player_profile=player_profile,
+    )
+    return moves
+
+
+def explain_game_with_summary(moves, played_as, config, game_result='unknown',
+                              player_profile=None, opening=None):
+    """Generate move commentary and the game overview in one API request.
+
+    These used to be two sequential Claude calls. Returning both from the same
+    response noticeably shortens the wait and removes a second failure point.
+    """
     api_key = config.get('anthropic_api_key')
     if not moves:
-        return moves
+        return moves, None
 
     fill_fast_comments(moves, played_as)
     if not api_key or not needs_claude_commentary(moves, played_as):
-        return moves
+        return moves, None
 
     client = anthropic.Anthropic(api_key=api_key)
 
     try:
-        comments = _batch_comments(client, moves, played_as, game_result, config, player_profile)
+        result = _batch_comments(
+            client, moves, played_as, game_result, config,
+            player_profile=player_profile,
+            opening=opening,
+        )
     except Exception as e:
         print(f"Claude batch explanation failed: {e}")
-        return moves
+        return moves, None
 
-    for item in comments:
+    for item in (result.get('comments') if isinstance(result.get('comments'), list) else []):
+        if not isinstance(item, dict) or not isinstance(item.get('comment'), str):
+            continue
         idx     = item.get('idx')
         comment = item.get('comment', '').strip()
-        if idx is not None and 0 <= idx < len(moves) and comment:
+        if type(idx) is int and 0 <= idx < len(moves) and _needs_claude(moves[idx], played_as) and comment:
             moves[idx]['explanation'] = _safe_claude_comment(comment, moves[idx])
 
-    return moves
+    summary = result.get('game_summary')
+    if not isinstance(summary, str) or not summary.strip():
+        summary = None
+    return moves, summary.strip() if summary else None
 
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _batch_comments(client, moves, played_as, game_result, config, player_profile=None):
+def _batch_comments(client, moves, played_as, game_result, config,
+                    player_profile=None, opening=None):
     skip_idxs  = {
         idx for idx, move in enumerate(moves)
         if not _needs_claude(move, played_as)
@@ -236,10 +159,15 @@ def _batch_comments(client, moves, played_as, game_result, config, player_profil
         1 for m in moves
         if _needs_claude(m, played_as) and (m.get('candidates') or m.get('pv_line'))
     )
+    from analysis.coaching import enrich_game
+    teaching_review = enrich_game([dict(m) for m in moves], played_as)
+    teaching_context = json.dumps(teaching_review.get('themes', []), ensure_ascii=False)
     profile_block = f"{player_profile}\n\n" if player_profile else ""
     user_prompt = (
         f"{profile_block}"
-        f"Game: I am playing as {played_as}. Result: {game_result}.\n\n"
+        f"Game: I am playing as {played_as}. Result: {game_result}. "
+        f"Opening: {opening or 'unknown'}.\n\n"
+        f"Evidence-linked learning themes (examples, not claims of repeated habits): {teaching_context}\n\n"
         f"Full move sequence (for context):\n{move_seq}\n\n"
         f"Player moves needing detailed commentary ({n_requested} total; {n_with_engine_data} have deep Stockfish data):\n"
         f"All evals are from YOUR perspective as {played_as} (positive = you are better).\n"
@@ -247,9 +175,11 @@ def _batch_comments(client, moves, played_as, game_result, config, player_profil
         f"they are the only source you may use for piece-square claims.\n"
         f"Phase markers indicate opening/middlegame/endgame boundaries.\n\n"
         f"{move_block}\n\n"
-        f"REMINDER: Check each mistake against the player profile above FIRST. "
-        f"If it matches a recurring pattern, say so explicitly. "
-        f"Use only the VERIFIED FACTS for any positional or tactical claims — never invent piece locations or motifs."
+        f"Explain the decision, the alternative and a reusable habit. "
+        f"Use only the VERIFIED FACTS for any positional or tactical claims — never invent piece locations or motifs.\n"
+        f"Also write game_summary: 3–5 short sentences covering how the opening went, "
+        f"a meaningful turning point, one supported good decision to repeat when available, "
+        f"and one transferable principle to practice. Cite the example move for each lesson."
     )
 
     model = config.get('explain_model', 'claude-sonnet-4-6')
@@ -288,7 +218,9 @@ def _batch_comments(client, moves, played_as, game_result, config, player_profil
         raw = raw.rsplit('```', 1)[0].strip()
 
     data = json.loads(raw)
-    return data.get('comments', [])
+    if not isinstance(data, dict):
+        raise ValueError('Claude response was not a JSON object')
+    return data
 
 
 def _build_move_sequence(moves):
@@ -370,6 +302,11 @@ def _build_move_block(moves, played_as, skip_idxs=None):
                 lines.append("  MOVE FACTS (machine-generated, 100% accurate):")
                 for fact in facts:
                     lines.append(f"    - {fact}")
+
+        from analysis.coaching import move_lesson
+        lesson = move_lesson(m)
+        lines.append('  VERIFIED MOVE FEATURE: ' + lesson['idea'])
+        lines.append('  LEGALLY REPLAYED LINE: ' + ' '.join(step['san'] for step in lesson['line']))
 
         # Append rich Stockfish data block for critical positions
         # cp values are stored from WHITE's perspective; flip for black so all evals
@@ -526,7 +463,7 @@ def _verified_move_facts(move, played_as):
             f"Evaluation (mover's perspective) changed from {sb}{e_before/100:.1f} to {sa}{e_after/100:.1f} pawns."
         )
 
-    delta = abs(move.get('delta') or 0)
+    delta = max(0, move.get('delta') or 0)
     if delta:
         facts.append(f"Centipawn loss: about {delta/100:.1f} pawns.")
 
@@ -573,7 +510,7 @@ def _after_move_facts(board_after, move, san, mover_color, hanging_before=None):
         if attackers and not defenders:
             facts.append(
                 f"After {san}: the moved {_PIECE_NAMES[moved_piece.piece_type]} on "
-                f"{chess.square_name(to_sq)} is undefended and can be captured for free (hanging)."
+                f"{chess.square_name(to_sq)} is attacked and undefended; verify legal captures and compensation before concluding it is lost."
             )
         elif attackers:
             atk_vals = [piece_values.get(
@@ -630,7 +567,7 @@ def _move_facts(board, move, label):
         if not recapturers:
             facts.append(
                 f"{label}: it captures an UNDEFENDED {captured_color} {captured_name} on {to_sq} "
-                f"(no recapturer — this wins material outright)."
+                f"(no geometric defender on that square; check the continuation before concluding material is won)."
             )
         else:
             recap_names = ', '.join(
@@ -640,7 +577,7 @@ def _move_facts(board, move, label):
             )
             facts.append(
                 f"{label}: it captures a {captured_color} {captured_name} on {to_sq}, "
-                f"but {to_sq} is DEFENDED by {captured_color} {recap_names} — this is an exchange, NOT a free piece."
+                f"but {to_sq} is DEFENDED by {captured_color} {recap_names} — calculate legal recaptures and the continuation."
             )
     elif board.is_en_passant(move):
         captured_sq = chess.square(chess.square_file(move.to_square), chess.square_rank(move.from_square))
@@ -668,7 +605,7 @@ def _needs_claude(move, played_as):
 
 def _opponent_comment(move):
     cls = move.get('classification')
-    delta = abs(move.get('delta') or 0)
+    delta = move.get('delta') or 0
     if cls in ('blunder', 'mistake', 'inaccuracy') or delta >= 150:
         return "Your opponent gave you a chance here — check the engine suggestion before moving on."
     return _AUTO_OPP_COMMENT
@@ -746,7 +683,12 @@ def _has_extra_square_mentions(comment, move):
         allowed.update(s.lower() for s in _SAN_SQ_RE.findall(san or ''))
     for c in (move.get('candidates') or []):
         allowed.update(s.lower() for s in _SAN_SQ_RE.findall(c.get('san') or ''))
-    # Comments may only mention squares that appear in allowed move notation
+    for fact in _verified_move_facts(move, move.get('color')):
+        allowed.update(_SQUARE_RE.findall(fact))
+    from analysis.coaching import move_lesson
+    for step in move_lesson(move)['line']:
+        allowed.update(_SAN_SQ_RE.findall(step['san']))
+    # Square validation is a guardrail, not proof of a tactical claim.
     for square in _SQUARE_RE.findall(comment or ''):
         if square.lower() not in allowed:
             return True

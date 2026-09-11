@@ -9,13 +9,14 @@ from concurrent.futures import ThreadPoolExecutor
 
 from flask import Flask, jsonify, render_template, request, send_from_directory
 
+from analysis.coaching import enrich_game
 from analysis.blueprint import generate_blueprint
 from analysis.claude_explain import (
+    build_local_game_summary,
     commentary_incomplete,
-    explain_game,
+    explain_game_with_summary,
     fill_fast_comments,
     finalize_fast_comments,
-    generate_game_summary,
     needs_claude_commentary,
 )
 from analysis.engine import annotate_game, get_best_move
@@ -265,6 +266,7 @@ def get_game(game_id):
 
         if moves is not None:
             claude_ok = bool(analysis['claude_ok']) if analysis['claude_ok'] is not None else True
+            result['review'] = enrich_game(moves, result.get('played_as'))
             result['moves']        = moves
             result['analyzing']    = False
             result['claude_ok']    = claude_ok
@@ -279,10 +281,12 @@ def get_game(game_id):
                 with _analysis_lock:
                     pending = game_id in _analysis_in_progress
                     can_retry = _commentary_failures.get(game_id, 0) < MAX_COMMENTARY_RETRIES
+                    commentary_error = _analysis_errors.get(game_id)
                 if not pending and can_retry:
                     _maybe_start_commentary(game_id, dict(game), moves)
                     pending = True
                 result['commentary_pending'] = pending
+                result['commentary_error'] = commentary_error
             else:
                 moves = finalize_fast_comments(moves, result.get('played_as'))
                 result['moves'] = moves
@@ -366,15 +370,25 @@ def analysis_status(game_id):
         row = conn.execute(
             'SELECT analyzed FROM games WHERE id = ?', (game_id,)
         ).fetchone()
+        analysis = conn.execute(
+            'SELECT claude_ok FROM analysis WHERE game_id = ?', (game_id,)
+        ).fetchone() if row else None
     finally:
         conn.close()
     if not row:
         return jsonify({'error': 'not found'}), 404
     with _analysis_lock:
         prog = _analysis_progress.get(game_id)
+        stage = _analysis_stage.get(game_id)
+        error = _analysis_errors.get(game_id)
+        pending = game_id in _analysis_in_progress
     return jsonify({
         'analyzed': bool(row['analyzed']),
         'progress': {'done': prog[0], 'total': prog[1]} if prog else None,
+        'stage': stage,
+        'pending': pending,
+        'claude_ok': bool(analysis['claude_ok']) if analysis else None,
+        'error': error,
     })
 
 # ---------------------------------------------------------------------------
@@ -632,6 +646,11 @@ _analysis_lock = threading.Lock()
 _commentary_failures = {}
 MAX_COMMENTARY_RETRIES = 2
 
+# Ephemeral task state for responsive status polling. Database results remain
+# the source of truth; these maps only describe work happening right now.
+_analysis_stage = {}
+_analysis_errors = {}
+
 # game_id → (positions_done, positions_total) while Stockfish runs.
 # Guarded by _analysis_lock; read by the status endpoint for the progress UI.
 _analysis_progress = {}
@@ -651,6 +670,8 @@ def _maybe_start_analysis(game_id, game, force=False):
         if game_id in _analysis_in_progress:
             return
         _analysis_in_progress.add(game_id)
+        _analysis_stage[game_id] = 'stockfish'
+        _analysis_errors.pop(game_id, None)
     _stockfish_pool.submit(_run_analysis, game_id, game)
 
 
@@ -660,6 +681,8 @@ def _maybe_start_commentary(game_id, game, moves):
         if game_id in _analysis_in_progress:
             return
         _analysis_in_progress.add(game_id)
+        _analysis_stage[game_id] = 'commentary'
+        _analysis_errors.pop(game_id, None)
     _claude_pool.submit(_run_commentary, game_id, game, moves)
 
 
@@ -671,24 +694,24 @@ def _run_commentary(game_id, game, moves):
         username  = game.get('username', CONFIG.get('chesscom_username', ''))
         moves = fill_fast_comments(moves, played_as)
         player_profile = get_player_weakness_summary(username, DB_PATH)
+        game_summary = build_local_game_summary(
+            moves, played_as,
+            game_result=game.get('result', 'unknown'),
+            opening=game.get('opening'),
+        )
         if needs_claude_commentary(moves, played_as):
-            moves = explain_game(
-                moves, played_as, CONFIG,
-                game_result=game.get('result', 'unknown'),
-                player_profile=player_profile,
-            )
-        # explain_game swallows API errors — detect failure by leftover
-        # pending placeholders so claude_ok reflects reality.
-        claude_ok = not commentary_incomplete(moves, played_as)
-        game_summary = None
-        if claude_ok:
-            moves = finalize_fast_comments(moves, played_as)
-            game_summary = generate_game_summary(
+            moves, generated_summary = explain_game_with_summary(
                 moves, played_as, CONFIG,
                 game_result=game.get('result', 'unknown'),
                 player_profile=player_profile,
                 opening=game.get('opening'),
             )
+            game_summary = generated_summary or game_summary
+        # The commentary helper preserves fast placeholders on an API failure;
+        # use those placeholders to determine whether the batch completed.
+        claude_ok = not commentary_incomplete(moves, played_as)
+        if claude_ok:
+            moves = finalize_fast_comments(moves, played_as)
 
         conn = sqlite3.connect(DB_PATH, timeout=30)
         conn.execute(
@@ -706,12 +729,14 @@ def _run_commentary(game_id, game, moves):
     except Exception as e:
         with _analysis_lock:
             _commentary_failures[game_id] = _commentary_failures.get(game_id, 0) + 1
+            _analysis_errors[game_id] = friendly_api_error(e)
         print(f"Commentary failed for {game_id}: {e}")
     finally:
         if conn:
             conn.close()
         with _analysis_lock:
             _analysis_in_progress.discard(game_id)
+            _analysis_stage.pop(game_id, None)
 
 
 def _run_analysis(game_id, game):
@@ -741,27 +766,28 @@ def _run_analysis(game_id, game):
         conn = None
 
         # Phase 2: Claude commentary + game summary.
+        with _analysis_lock:
+            _analysis_stage[game_id] = 'commentary'
         username = game.get('username', CONFIG.get('chesscom_username', ''))
         player_profile = get_player_weakness_summary(username, DB_PATH)
+        game_summary = build_local_game_summary(
+            moves, played_as,
+            game_result=game.get('result', 'unknown'),
+            opening=game.get('opening'),
+        )
         if needs_commentary:
-            moves = explain_game(
-                moves, played_as, CONFIG,
-                game_result=game.get('result', 'unknown'),
-                player_profile=player_profile,
-            )
-        # explain_game swallows API errors — detect failure by leftover pending
-        # placeholders. On failure keep claude_ok=0 so the status-poll retry
-        # path (capped by MAX_COMMENTARY_RETRIES) can pick it up.
-        claude_ok = not commentary_incomplete(moves, played_as)
-        game_summary = None
-        if claude_ok:
-            moves = finalize_fast_comments(moves, played_as)
-            game_summary = generate_game_summary(
+            moves, generated_summary = explain_game_with_summary(
                 moves, played_as, CONFIG,
                 game_result=game.get('result', 'unknown'),
                 player_profile=player_profile,
                 opening=game.get('opening'),
             )
+            game_summary = generated_summary or game_summary
+        # On API failure the fast placeholders remain. Keep claude_ok=0 so the
+        # status-poll retry path (capped by MAX_COMMENTARY_RETRIES) can resume.
+        claude_ok = not commentary_incomplete(moves, played_as)
+        if claude_ok:
+            moves = finalize_fast_comments(moves, played_as)
         else:
             with _analysis_lock:
                 _commentary_failures[game_id] = _commentary_failures.get(game_id, 0) + 1
@@ -785,6 +811,8 @@ def _run_analysis(game_id, game):
 
         conn.commit()
     except Exception as e:
+        with _analysis_lock:
+            _analysis_errors[game_id] = friendly_api_error(e)
         print(f"Analysis failed for {game_id}: {e}")
     finally:
         if conn:
@@ -792,6 +820,7 @@ def _run_analysis(game_id, game):
         with _analysis_lock:
             _analysis_in_progress.discard(game_id)
             _analysis_progress.pop(game_id, None)
+            _analysis_stage.pop(game_id, None)
 
 
 def _auto_gen_patterns(username):

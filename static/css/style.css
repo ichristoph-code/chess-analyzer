@@ -3,18 +3,18 @@
    ========================================================= */
 
 :root {
-  --bg:          #0b0d18;
-  --surface-1:   #12152a;
-  --card:        #1a1e38;
-  --card-hover:  rgba(32, 36, 66, 0.55);
-  --border:      #262b4a;
-  --border-soft: rgba(148, 163, 216, 0.14);
-  --accent:      #8b5cf6;
-  --accent-strong: #7c3aed;
-  --accent-soft: rgba(139, 92, 246, 0.14);
-  --accent-text: #c4b5fd;
-  --text:        #e6eaf4;
-  --muted:       #7d87a3;
+  --bg:          #090a0f;
+  --surface-1:   #121319;
+  --card:        #1b1c24;
+  --card-hover:  rgba(255, 255, 255, 0.055);
+  --border:      rgba(255, 255, 255, 0.09);
+  --border-soft: rgba(255, 255, 255, 0.06);
+  --accent:      #9685ff;
+  --accent-strong: #7867e8;
+  --accent-soft: rgba(150, 133, 255, 0.14);
+  --accent-text: #c8bfff;
+  --text:        #f3f3f6;
+  --muted:       #92939d;
   --win:         #22c55e;
   --loss:        #ef4444;
   --draw:        #94a3b8;
@@ -22,8 +22,8 @@
   --mistake:     #f97316;
   --inaccuracy:  #facc15;
   --best:        #22c55e;
-  --radius:      10px;
-  --shadow-pop:  0 12px 40px rgba(0, 0, 0, 0.55);
+  --radius:      12px;
+  --shadow-pop:  0 18px 54px rgba(0, 0, 0, 0.48);
   --app-height:  100vh;
 }
 
@@ -1625,5 +1625,256 @@ body {
   #nav button {
     padding-left: 8px;
     padding-right: 8px;
+  }
+}
+
+/* =========================================================
+   Refined macOS-style finish
+   ========================================================= */
+
+html,
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
+  letter-spacing: -0.01em;
+}
+
+body {
+  background:
+    radial-gradient(900px 480px at 18% -12%, rgba(120, 103, 232, 0.13), transparent 62%),
+    radial-gradient(800px 500px at 105% 8%, rgba(72, 91, 177, 0.08), transparent 58%),
+    var(--bg);
+}
+
+#nav {
+  min-height: 56px;
+  padding: calc(9px + env(safe-area-inset-top)) 16px 9px;
+  background: rgba(18, 19, 25, 0.78);
+  border-bottom-color: var(--border);
+  box-shadow: 0 1px 0 rgba(0, 0, 0, 0.28);
+}
+
+#nav h1 {
+  font-size: 15px;
+  font-weight: 650;
+  letter-spacing: -0.025em;
+}
+
+.nav-app-icon {
+  width: 28px;
+  height: 28px;
+  border-radius: 7px;
+  box-shadow: 0 3px 12px rgba(0, 0, 0, 0.32);
+}
+
+#model-switch {
+  padding: 2px;
+  gap: 2px;
+  border: none;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.07);
+}
+
+#nav #model-switch button {
+  min-height: 28px;
+  padding: 4px 11px;
+  border-radius: 8px;
+  font-size: 12px;
+}
+
+#nav #model-switch button.active {
+  background: rgba(255, 255, 255, 0.14);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.28);
+}
+
+#btn-fetch {
+  background: var(--text);
+  color: #121319;
+  box-shadow: none;
+}
+
+#btn-fetch:hover {
+  filter: none;
+  background: #fff;
+}
+
+#btn-nav-menu {
+  border: none !important;
+  background: rgba(255, 255, 255, 0.065);
+}
+
+#game-list-panel,
+#analysis-panel {
+  background: rgba(18, 19, 25, 0.82);
+}
+
+#game-list-panel h2 {
+  padding: 15px 16px 8px;
+  border-bottom: none;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+}
+
+#game-list {
+  padding: 4px 7px 10px;
+}
+
+.game-item {
+  margin: 2px 0;
+  padding: 10px 11px;
+  border: 1px solid transparent;
+  border-radius: 11px;
+  transition: background 0.16s ease, border-color 0.16s ease, transform 0.16s ease;
+}
+
+.game-item:hover {
+  background: var(--card-hover);
+  transform: translateY(-1px);
+}
+
+.game-item.active {
+  background: var(--accent-soft);
+  border-color: rgba(150, 133, 255, 0.24);
+}
+
+.game-opponent {
+  font-size: 13px;
+  font-weight: 620;
+}
+
+.result-badge,
+.badge,
+.stat-chip {
+  border-radius: 999px;
+}
+
+#board-container {
+  padding-top: 22px;
+}
+
+#board {
+  border-radius: 12px;
+  border-color: rgba(255, 255, 255, 0.13);
+  box-shadow:
+    0 0 0 1px rgba(0, 0, 0, 0.35),
+    0 20px 60px rgba(0, 0, 0, 0.48);
+}
+
+#eval-graph {
+  margin: 8px 12px 0;
+  width: calc(100% - 24px);
+  height: 54px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+#move-nav {
+  margin: 8px 10px 2px;
+  padding: 4px;
+  gap: 3px;
+  border: none;
+  border-radius: 11px;
+  background: rgba(255, 255, 255, 0.045);
+}
+
+#move-nav button {
+  min-width: 36px;
+  padding: 5px 9px;
+  border: none;
+  background: transparent;
+}
+
+#move-nav button:hover {
+  border-color: transparent;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.move-btn {
+  border-radius: 7px;
+}
+
+.move-btn.current {
+  background: var(--accent-strong);
+  box-shadow: 0 3px 12px rgba(120, 103, 232, 0.32);
+}
+
+#analysis-header {
+  padding: 16px 20px 12px;
+}
+
+#analysis-move-label {
+  font-size: 18px;
+  letter-spacing: -0.025em;
+}
+
+#game-overview-header,
+#analysis-coach-label {
+  letter-spacing: 0.07em;
+}
+
+#analysis-comment {
+  font-size: 14px;
+  line-height: 1.62;
+}
+
+#commentary-banner {
+  margin: 7px 10px 3px;
+  padding: 8px 11px;
+  border: 1px solid rgba(150, 133, 255, 0.22);
+  border-left-width: 1px;
+  border-radius: 10px;
+}
+
+#analysis-error {
+  margin: 7px 10px 3px;
+  border: 1px solid rgba(239, 68, 68, 0.24);
+  border-radius: 10px;
+}
+
+.toast {
+  bottom: 28px;
+  padding: 10px 16px;
+  border-color: rgba(255, 255, 255, 0.12);
+  border-radius: 12px;
+  background: rgba(36, 37, 46, 0.94);
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+}
+
+button {
+  font-family: inherit;
+}
+
+button:active {
+  transform: scale(0.97);
+}
+
+@media (max-width: 900px) {
+  #nav {
+    min-height: 54px;
+    padding: calc(7px + env(safe-area-inset-top)) 10px 7px;
+  }
+
+  .nav-app-icon {
+    width: 26px;
+    height: 26px;
+  }
+
+  #game-list {
+    padding-inline: 7px;
+  }
+
+  .game-item {
+    margin: 3px 0;
+    min-height: 60px;
+  }
+
+  #mobile-tab-bar {
+    background: rgba(18, 19, 25, 0.88);
+    backdrop-filter: blur(18px);
+    -webkit-backdrop-filter: blur(18px);
+  }
+
+  .tab-btn.active {
+    color: var(--accent-text);
   }
 }
